@@ -141,10 +141,10 @@ After the pull, nothing ever leaves your machine — scope gate, fusion, and the
 | **DeepSeek** | `DEEPSEEK_API_KEY` | [platform.deepseek.com](https://platform.deepseek.com) — very cheap |
 | **OpenRouter** | `OPENROUTER_API_KEY` | [openrouter.ai/keys](https://openrouter.ai/keys) — 100+ models, one key |
 | **LiteLLM** | `LITELLM_API_KEY` (+ `LITELLM_BASE_URL`) | one gateway in front of keys you already own |
-| Claude API | `ANTHROPIC_API_KEY` | [console.anthropic.com](https://console.anthropic.com) |
-| OpenAI | `OPENAI_API_KEY` | [platform.openai.com](https://platform.openai.com) |
-| Grok (xAI) | `XAI_API_KEY` | [console.x.ai](https://console.x.ai) |
-
+| **Claude API** | `ANTHROPIC_API_KEY` | [console.anthropic.com](https://console.anthropic.com) |
+| **OpenAI** | `OPENAI_API_KEY` | [platform.openai.com](https://platform.openai.com) |
+| **Grok (xAI)** | `XAI_API_KEY` | [console.x.ai](https://console.x.ai) |
+| **Nvidia** | `NVIDIA_API_KEY` | .[build.nvdia.com](https://build.nvdia.com).|
 Providers are auto-detected free-first (**Ollama → Groq → DeepSeek → … → OpenRouter → Claude → OpenAI**); LiteLLM stays opt-in so it never preempts a provider you already configured. Switch anytime with `rhodawk setup` (interactive), `rhodawk setup --provider ollama --model qwen2.5:14b` (non-interactive), or inspect with `rhodawk providers` / `rhodawk models`.
 
 ---
