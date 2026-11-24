@@ -31,6 +31,7 @@ __all__ = [
     "is_local_target",
     "is_safe_host",
     "safe_target_dirname",
+    "recon_dirname",
 ]
 
 _SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://", re.IGNORECASE)
@@ -173,6 +174,22 @@ def safe_target_dirname(raw: str) -> str | None:
     """
     host, _ = normalize_target(raw)
     return host if is_safe_host(host) else None
+
+
+def recon_dirname(raw: str) -> str | None:
+    """Output-directory key for a recon run: the normalized host, suffixed
+    with ``_<port>`` when the target carries an explicit port (C10 —
+    ``127.0.0.1:8082`` and ``127.0.0.1:8083`` previously collided on the bare
+    host name and overwrote each other's artifacts). Portless targets keep
+    today's bare-host name. Returns None for anything unsafe (same contract
+    as safe_target_dirname — None means reject the target)."""
+    host, port = normalize_target(raw)
+    if not host or not is_safe_host(host):
+        return None
+    if port:
+        candidate = f"{host}_{port}"
+        return candidate if is_safe_host(candidate) else None
+    return host
 
 
 if __name__ == "__main__":  # tiny CLI for shell/debug parity checks

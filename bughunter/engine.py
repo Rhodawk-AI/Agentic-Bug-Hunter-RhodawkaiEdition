@@ -696,16 +696,17 @@ def _scope_flag_args(args) -> list[str]:
 
 def cmd_recon(args):
     """Run recon pipeline then AI surface analysis."""
-    from tools.target_normalize import safe_target_dirname
+    from tools.target_normalize import recon_dirname
 
     target = args.target
     # The scanners need a bare host; the output dir must match what
-    # recon_engine.sh writes. Both derive it the same way (host, no scheme/port),
-    # and we pin RECON_OUT_DIR so the two never disagree across install layouts.
+    # recon_engine.sh writes. Both derive it the same way (host, or host_port
+    # so two ports on one host never collide — C10), and we pin RECON_OUT_DIR
+    # so the two never disagree across install layouts.
     # Reject anything that isn't a safe single path component — never fall
     # back to the raw target, or `recon ../../etc/x` / `recon /etc/x` would
     # write outside the recon sandbox.
-    host = safe_target_dirname(target)
+    host = recon_dirname(target)
     if not host:
         err(f"Refusing unsafe target {target!r} — expected a hostname, IP or CIDR")
         return
@@ -748,10 +749,10 @@ def cmd_recon(args):
 
 def cmd_hunt(args):
     """Full hunt pipeline: recon + vuln scan + AI analysis."""
-    from tools.target_normalize import safe_target_dirname
+    from tools.target_normalize import recon_dirname
 
     target = args.target
-    host = safe_target_dirname(target)
+    host = recon_dirname(target)
     if not host:
         err(f"Refusing unsafe target {target!r} — expected a hostname, IP or CIDR")
         return

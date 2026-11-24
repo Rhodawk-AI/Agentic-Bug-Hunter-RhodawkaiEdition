@@ -232,6 +232,17 @@ def _validate_target(target: str) -> str:
 
 def _resolve_recon_dir(domain: str) -> str:
     domain = _validate_domain_for_path(domain)
+    # C10: a host:port target keys its own recon dir (127.0.0.1:8082 ->
+    # 127.0.0.1_8082) so two ports on one host never overwrite each other;
+    # portless targets keep today's path (same keying as engine.py's
+    # recon_dirname and recon_engine.sh).
+    try:
+        from tools.target_normalize import normalize_target as _norm
+        host, port = _norm(domain)
+        if port and host:
+            domain = f"{host}_{port}"
+    except Exception:
+        pass
     return os.path.join(RECON_DIR, domain)
 
 
@@ -513,7 +524,7 @@ def run_recon(domain, quick=False, scope_lock=False):
 
 def check_cicd_results(domain):
     """Check and surface CI/CD scan results from recon Phase 8."""
-    cicd_dir = os.path.join(RECON_DIR, domain, "cicd")
+    cicd_dir = os.path.join(_resolve_recon_dir(domain), "cicd")
     if not os.path.isdir(cicd_dir):
         return
     for root, dirs, files in os.walk(cicd_dir):
@@ -533,7 +544,7 @@ def ingest_lead_board(domain):
         log("warn", "lead_board.py missing — skip lead ingest")
         return False
 
-    recon_dir = os.path.join(RECON_DIR, domain)
+    recon_dir = _resolve_recon_dir(domain)
     if not os.path.isdir(recon_dir):
         log("warn", f"No recon dir for {domain} — skip lead ingest")
         return False
@@ -648,7 +659,7 @@ def run_graphql_audit(domain):
         log("warn", "graphql_audit.sh missing")
         return False
 
-    recon_dir = os.path.join(RECON_DIR, domain)
+    recon_dir = _resolve_recon_dir(domain)
     gql_files = [
         os.path.join(recon_dir, "urls", "graphql.txt"),
         os.path.join(recon_dir, "graphql.txt"),
@@ -721,7 +732,7 @@ def run_vuln_scan(domain, quick=False):
     """Run vulnerability scanner on recon results."""
     if _scope_blocks_target(domain):
         return False
-    recon_dir = os.path.join(RECON_DIR, domain)
+    recon_dir = _resolve_recon_dir(domain)
     if not os.path.isdir(recon_dir):
         log("err", f"No recon data found for {domain}. Run recon first.")
         return False
@@ -884,7 +895,7 @@ def run_zero_day_fuzzer(domain, deep=False):
     script = os.path.join(TOOLS_DIR, "zero_day_fuzzer.py")
 
     # argv list + shell=False — domain is user-controlled (injection-safe).
-    recon_dir = os.path.join(RECON_DIR, domain)
+    recon_dir = _resolve_recon_dir(domain)
     cmd = ["python3", script, f"https://{domain}"]
     if os.path.isdir(recon_dir):
         cmd += ["--recon-dir", recon_dir]
@@ -943,7 +954,7 @@ def hunt_target(
             log("warn", f"Recon had issues for {domain}, continuing anyway...")
 
         # Post-recon enrichment: never lose a lead + flag EOL tech.
-        if not skip_leads and os.path.isdir(os.path.join(RECON_DIR, domain)):
+        if not skip_leads and os.path.isdir(_resolve_recon_dir(domain)):
             result["leads"] = ingest_lead_board(domain)
             run_eol_check(domain)
 

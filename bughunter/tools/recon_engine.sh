@@ -256,7 +256,16 @@ if [ "${TARGET_TYPE:-}" != "list" ] && [ "${TARGET_TYPE:-}" != "cidr" ] \
     _normalize_target "$TARGET"
 fi
 
-RECON_DIR="${RECON_OUT_DIR:-$BASE_DIR/recon/$TARGET}"
+# C10: host:port targets key their own recon dir (127.0.0.1:8082 ->
+# 127.0.0.1_8082) so two ports on one host never overwrite each other's
+# artifacts. RECON_OUT_DIR is pinned by engine.py (which keys it the same
+# way via target_normalize.recon_dirname); the standalone-shell default keys
+# host_port here. Portless targets keep today's bare-host path.
+if [ -n "${RECON_OUT_DIR:-}" ]; then
+    RECON_DIR="$RECON_OUT_DIR"
+else
+    RECON_DIR="$BASE_DIR/recon/$TARGET${TARGET_PORT:+_$TARGET_PORT}"
+fi
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 THREADS="${BB_THREADS:-50}"
 RATE_LIMIT="${BB_RATE_LIMIT:-150}"  # requests per second

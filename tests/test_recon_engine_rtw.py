@@ -751,3 +751,78 @@ class TestRunIncompleteMarker:
             (rtw_env["recon_out"] / "recon_truth.json").read_text())
         assert truth3.get("previous_run_incomplete") is False
         assert not (rtw_env["recon_out"] / ".run_incomplete").exists()
+
+
+class TestHostPortReconDirs:
+    """C10 regression: 127.0.0.1:8082 and 127.0.0.1:8083 key separate recon
+    directories; the first run's data survives the second run."""
+
+    def test_two_ports_two_dirs(self, rtw_env):
+        import http.server
+        import threading
+
+        def handler(port_label):
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    self.wfile.write(
+                        f"<html><title>LAB {port_label}</title></html>".encode())
+
+                def log_message(self, *a):
+                    pass
+            return H
+
+        srv1 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler("P1"))
+        srv2 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler("P2"))
+        for srv in (srv1, srv2):
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            env = os.environ.copy()
+            env.update({
+                "BUGHUNTER_HOME": str(rtw_env["home"]),
+                "BUGHUNTER_CAPABILITIES_FILE": str(rtw_env["capabilities"]),
+            })
+            common = [sys.executable,
+                      str(REPO_ROOT / "bughunter" / "engine.py"), "recon"]
+            p1 = subprocess.run(common + [f"127.0.0.1:{srv1.server_port}"],
+                                cwd=str(REPO_ROOT), env=env,
+                                capture_output=True, text=True, timeout=300)
+            p2 = subprocess.run(common + [f"127.0.0.1:{srv2.server_port}"],
+                                cwd=str(REPO_ROOT), env=env,
+                                capture_output=True, text=True, timeout=300)
+            assert p1.returncode == 0, (p1.stdout + p1.stderr)[-2000:]
+            assert p2.returncode == 0, (p2.stdout + p2.stderr)[-2000:]
+            base = rtw_env["home"] / "recon"
+            d1 = base / f"127.0.0.1_{srv1.server_port}"
+            d2 = base / f"127.0.0.1_{srv2.server_port}"
+            assert d1.is_dir() and d2.is_dir(), \
+                f"host:port dirs missing: {sorted(p.name for p in base.iterdir())}"
+            # the data-home mirror (~/.bughunter/recon/<host>/recon_truth.json)
+            # stays host-keyed by design — assert the OUTPUT pipeline itself
+            # never writes artifacts into a bare-host dir
+            assert not (base / "127.0.0.1" / "live").is_dir(), \
+                "legacy bare-host OUTPUT dir still written for host:port targets"
+            full1 = (d1 / "live" / "httpx_full.txt").read_text()
+            full2 = (d2 / "live" / "httpx_full.txt").read_text()
+            assert f"127.0.0.1:{srv1.server_port}" in full1, full1
+            assert f"127.0.0.1:{srv2.server_port}" in full2, full2
+            assert f"127.0.0.1:{srv2.server_port}" not in full1, \
+                "run 2 overwrote run 1's directory contents"
+        finally:
+            srv1.shutdown(); srv2.shutdown()
+            srv1.server_close(); srv2.server_close()
+
+    def test_hunt_resolve_recon_dir_port_aware(self, monkeypatch, tmp_path):
+        sys.path.insert(0, str(REPO_ROOT / "bughunter"))
+        sys.path.insert(0, str(REPO_ROOT / "bughunter" / "tools"))
+        monkeypatch.setenv("BUGHUNTER_HOME", str(tmp_path))
+        import importlib
+        import tools.hunt as hunt
+        importlib.reload(hunt)
+        assert hunt._resolve_recon_dir(
+            "127.0.0.1:8080").endswith(os.path.join("recon", "127.0.0.1_8080"))
+        assert hunt._resolve_recon_dir(
+            "app.example.test").endswith(
+                os.path.join("recon", "app.example.test"))
