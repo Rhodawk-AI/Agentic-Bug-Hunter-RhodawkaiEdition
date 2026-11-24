@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -59,6 +60,30 @@ SCHEMA_VERSION = "1.0"
 CLASS_CDN_EDGE = "CDN_EDGE"
 CLASS_SAAS = "THIRD_PARTY_SAAS"
 CLASS_ORIGIN = "FIRST_PARTY_ORIGIN"
+
+# tool_health pseudo-capability recording the canonical-fusion step itself.
+# A failed fuse used to be swallowed as a single non-fatal log line; it is now
+# persisted as a FAILED row in rtw_manifest.json so recon_truth.json's
+# tool_health (and the adapter health-table) surface it until fusion heals.
+FUSION_CAPABILITY_ID = "FUSION"
+
+# Truth-level status (B7): "OK" or "DEGRADED" when a required input is
+# unparseable. See input_integrity().
+STATUS_OK = "OK"
+STATUS_DEGRADED = "DEGRADED"
+
+# Recon-dir inputs tracked by the integrity block (B7). A REQUIRED input that
+# is present but unparseable (binary garbage / NUL bytes / undecodable)
+# degrades the whole truth document — downstream consumers must not treat the
+# fused counts as reliable.
+_INTEGRITY_INPUTS = (
+    "subdomains/all.txt", "live/httpx_full.txt", "live/urls.txt",
+    "urls/all.txt", "ports/nmap_greppable.txt", "js/endpoints.txt",
+)
+_REQUIRED_INPUTS = (
+    "subdomains/all.txt", "live/httpx_full.txt", "urls/all.txt",
+    "ports/nmap_greppable.txt",
+)
 
 # Same status vocabulary as rtw_adapter.py's manifest entries (fusion is
 # stdlib-only and must not import the adapter).
@@ -338,9 +363,78 @@ def data_home() -> Path:
     return Path.home() / ".bughunter"
 
 
+def input_integrity(recon_dir: Path) -> Dict[str, str]:
+    """Per-input-file integrity for the fusion pass (B7): "ok" / "empty" /
+    "missing" / "unparseable". Unparseable = present with content that is not
+    valid UTF-8 text or contains NUL bytes (binary garbage, truncation,
+    encoding tricks). Never raises."""
+    out: Dict[str, str] = {}
+    for rel in _INTEGRITY_INPUTS:
+        try:
+            raw = (recon_dir / rel).read_bytes()
+        except OSError:
+            out[rel] = "missing"
+            continue
+        if not raw.strip():
+            out[rel] = "empty"
+            continue
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            out[rel] = "unparseable"
+            continue
+        if b"\x00" in raw:
+            out[rel] = "unparseable"
+            continue
+        out[rel] = "ok"
+    return out
+
+
 def _host_key(target: str) -> str:
     s = _strip_host(target)
     return s or "unknown"
+
+
+def record_fusion_status(target: str, status: str, reason: str = "") -> None:
+    """Write (or clear) the FUSION row of rtw_manifest.json — the same manifest
+    the rtw_adapter uses, so tool_health in recon_truth.json and the
+    health-table both show the canonical-fusion outcome. status FAILED upserts
+    the row; any other status clears it (a successful fuse must not leave a
+    stale FAILED row behind). Never raises."""
+    manifest_path = data_home() / "recon" / _host_key(target) / "rtw_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            manifest = {}
+    except (OSError, ValueError):
+        manifest = {}
+    entries = manifest.setdefault("entries", [])
+    if status == RESULT_FAILED:
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        entries[:] = [e for e in entries
+                      if e.get("capability_id") != FUSION_CAPABILITY_ID]
+        entries.append({
+            "capability_id": FUSION_CAPABILITY_ID,
+            "rtw_function": "recon_fusion.fuse",
+            "target": _host_key(target),
+            "input_hash": "",
+            "status": RESULT_FAILED,
+            "started": now, "finished": now,
+            "reason": reason,
+        })
+    else:
+        kept = [e for e in entries
+                if e.get("capability_id") != FUSION_CAPABILITY_ID]
+        if len(kept) == len(entries):
+            return
+        manifest["entries"] = kept
+    try:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8")
+    except OSError:
+        pass
 
 
 # ── Fusion ────────────────────────────────────────────────────────────────────
@@ -530,23 +624,65 @@ def build_truth(recon_dir: Path, target: str,
     ports = parse_nmap_greppable(
         _read_lines(recon_dir / "ports" / "nmap_greppable.txt"))
     if not ports:
-        # Fallback: open_ports.txt (`80/open` lines) has no host column.
+        # Fallback: open_ports.txt (`80/open` lines) has no host column —
+        # inherently unjoinable, so these rows can only ever be unattributed.
         ports = [{"host": "", "port": int(p.split("/")[0]), "protocol": "tcp",
                   "service": ""}
                  for p in sorted(set(_read_lines(recon_dir / "ports" / "open_ports.txt")))
                  if p.split("/")[0].isdigit()]
+
+    # B4: attribute open ports ONLY to hosts they can be joined to. The nmap
+    # row's own hostname is kept; an IP is joined through hosts/resolution.txt
+    # ONLY when exactly ONE host resolves to it — a shared IP (loopback, NAT,
+    # CDN edge) is ambiguous and must never silently borrow port rows (the E9
+    # defect put port 80 on oos.example.test via the shared lab loopback).
+    # Everything unjoinable is reported under truth['unattributed_ports'].
+    ip_to_hosts: Dict[str, Set[str]] = {}
+    for _h, _res in resolution.items():
+        _ip = (_res or {}).get("ip", "")
+        if _ip:
+            ip_to_hosts.setdefault(_ip, set()).add(_h)
+
+    def _is_ip_literal(text: str) -> bool:
+        try:
+            ipaddress.ip_address(text)
+            return True
+        except ValueError:
+            return False
+
     seen_ports: Set[Tuple] = set()
     port_rows: List[dict] = []
+    unattributed_rows: List[dict] = []
     for p in ports:
-        key = (p["host"], p["port"])
+        key = (p.get("host") or "", p["port"])
         if key in seen_ports:
             continue
         seen_ports.add(key)
-        port_rows.append({"host": p["host"], "port": p["port"],
-                          "protocol": p.get("protocol", "tcp"),
-                          "service": p.get("service", ""),
-                          "discovered_by": ["ports/nmap_greppable.txt"]})
+        nmap_host = p.get("host") or ""
+        host_label = ""
+        if nmap_host and not _is_ip_literal(nmap_host):
+            host_label = nmap_host
+        elif nmap_host:
+            joinable = sorted(ip_to_hosts.get(nmap_host, set()))
+            if len(joinable) == 1:
+                host_label = joinable[0]
+        if host_label:
+            port_rows.append({"host": host_label, "port": p["port"],
+                              "protocol": p.get("protocol", "tcp"),
+                              "service": p.get("service", ""),
+                              "nmap_host": nmap_host,
+                              "discovered_by": ["ports/nmap_greppable.txt"]})
+        else:
+            unattributed_rows.append({
+                "port": p["port"],
+                "protocol": p.get("protocol", "tcp"),
+                "service": p.get("service", ""),
+                "source_host": nmap_host,
+                "discovered_by": ["ports/open_ports.txt"] if not nmap_host
+                                 else ["ports/nmap_greppable.txt"],
+            })
     port_rows.sort(key=lambda r: (r["host"], r["port"]))
+    unattributed_rows.sort(key=lambda r: (r["source_host"], r["port"]))
 
     # Tool health — the honest per-capability accounting from rtw_manifest.json.
     tool_health: List[dict] = []
@@ -582,6 +718,13 @@ def build_truth(recon_dir: Path, target: str,
 
     origin_ips = {ip for h in hosts if h["asset_class"] == CLASS_ORIGIN
                   for ip in h["ips"] if ip}
+    # B3: every line the post-enumeration scope filter dropped is quarantined
+    # in scope/dropped_oos.txt ("<relpath>\t<line>"); surface the count.
+    scope_dropped = len(_read_lines(recon_dir / "scope" / "dropped_oos.txt"))
+    # B7: per-input integrity; an unparseable REQUIRED input degrades the truth.
+    integrity = input_integrity(recon_dir)
+    status = STATUS_DEGRADED if any(integrity.get(rel) == "unparseable"
+                                    for rel in _REQUIRED_INPUTS) else STATUS_OK
     counts = {
         "subdomains": len(subdomains),
         "live_hosts": len(hosts),
@@ -592,6 +735,7 @@ def build_truth(recon_dir: Path, target: str,
         "open_ports": len(port_rows),
         "unique_urls": len(url_rows),
         "js_endpoints": len(js_rows),
+        "scope_dropped": scope_dropped,
     }
     return {
         "schema_version": SCHEMA_VERSION,
@@ -599,6 +743,8 @@ def build_truth(recon_dir: Path, target: str,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "scope_patterns": {"domains": list(scope_domains or []),
                            "excluded": list(scope_excluded or [])},
+        "status": status,
+        "input_integrity": integrity,
         "counts": counts,
         "tool_health": tool_health,
         "subdomains": subdomains,
@@ -606,6 +752,7 @@ def build_truth(recon_dir: Path, target: str,
         "urls": url_rows,
         "js_endpoints": js_rows,
         "ports": port_rows,
+        "unattributed_ports": unattributed_rows,
     }
 
 
@@ -650,18 +797,36 @@ def compute_delta(previous: dict, current: dict) -> dict:
 
 def fuse(recon_dir: Path, target: str,
          scope_domains: Optional[List[str]] = None,
-         scope_excluded: Optional[List[str]] = None) -> Tuple[dict, Optional[dict]]:
+         scope_excluded: Optional[List[str]] = None,
+         scope_enforced: bool = True) -> Tuple[dict, Optional[dict]]:
     """Build the new truth, diff against the previous run, archive the old
-    truth, write recon_truth.json + delta.json + the mirror copy."""
+    truth, write recon_truth.json + delta.json + the mirror copy.
+
+    scope_enforced=False records an explicit --no-scope-check run so the
+    truth document states its own enforcement status (B1)."""
     recon_dir = Path(recon_dir)
     truth_path = recon_dir / "recon_truth.json"
     delta_path = recon_dir / "delta.json"
+
+    # A successful fuse clears any stale FUSION=FAILED row BEFORE the truth is
+    # built, so recon_truth.json reflects this (healthy) fusion outcome.
+    record_fusion_status(target, "COMPLETED")
 
     previous: Optional[dict] = None
     try:
         previous = json.loads(truth_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         previous = None
+    if previous is None:
+        # B5: recon_engine.sh archives the previous run's truth under
+        # .prev_run/ and clears the recon dir before each run — the delta
+        # baseline lives there now.
+        try:
+            previous = json.loads(
+                (recon_dir / ".prev_run" / "recon_truth.json").read_text(
+                    encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = None
     if isinstance(previous, dict) and previous.get("schema_version"):
         try:
             (recon_dir / "recon_truth.prev.json").write_text(
@@ -672,7 +837,29 @@ def fuse(recon_dir: Path, target: str,
     else:
         previous = None
 
+    # B6: recon_engine.sh archives a leftover .run_incomplete marker to
+    # .prev_run/ at startup — its presence means the PREVIOUS run never
+    # reached a clean exit. Record it in this run's truth and warn.
+    previous_run_incomplete = (recon_dir / ".prev_run" / "run_incomplete").is_file()
+    if previous_run_incomplete:
+        print("[!] previous recon run did not complete cleanly — "
+              "previous_run_incomplete=true recorded in recon_truth.json",
+              file=sys.stderr)
+        # consume-once: the flag describes exactly the run before this one
+        try:
+            (recon_dir / ".prev_run" / "run_incomplete").unlink()
+        except OSError:
+            pass
+
     truth = build_truth(recon_dir, target, scope_domains, scope_excluded)
+    truth["scope_enforced"] = bool(scope_enforced)
+    truth["previous_run_incomplete"] = bool(previous_run_incomplete)
+    if truth.get("status") == STATUS_DEGRADED:
+        bad = [rel for rel, state in truth["input_integrity"].items()
+               if state == "unparseable"]
+        print(f"[!] recon_truth.json status DEGRADED — unparseable required "
+              f"input(s): {', '.join(bad)} (see input_integrity)",
+              file=sys.stderr)
     truth_path.write_text(json.dumps(truth, indent=2, sort_keys=True) + "\n",
                           encoding="utf-8")
 
@@ -718,7 +905,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_fuse.add_argument("--target", required=True)
     p_fuse.add_argument("--scope-domain", action="append", default=[])
     p_fuse.add_argument("--scope-exclude", action="append", default=[])
+    p_fuse.add_argument("--no-scope-check", action="store_true",
+                        help="record scope_enforced=false (recon_engine.sh forwards "
+                             "this when the run used the demo opt-out; fusion still runs)")
     p_fuse.add_argument("--quiet", action="store_true")
+
+    p_mark = sub.add_parser(
+        "mark-failed",
+        help="record a FAILED FUSION row in rtw_manifest.json (surfaces in "
+             "tool_health + health-table); used by recon_engine.sh when fuse fails")
+    p_mark.add_argument("--target", required=True)
+    p_mark.add_argument("--reason", required=True)
 
     p_classify = sub.add_parser("classify",
                                 help="write hosts/host_classes.txt + origin_targets.txt "
@@ -738,6 +935,12 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"{counts['CDN_EDGE']} CDN edge(s), {counts['THIRD_PARTY_SAAS']} third-party SaaS")
         return 0
 
+    if args.cmd == "mark-failed":
+        record_fusion_status(args.target, RESULT_FAILED, args.reason)
+        print(f"[!] FUSION marked FAILED in rtw_manifest.json: {args.reason}",
+              file=sys.stderr)
+        return 0
+
     if args.cmd == "delta-line":
         try:
             delta = json.loads(
@@ -750,7 +953,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     truth, delta = fuse(Path(args.recon_dir), args.target,
                         scope_domains=args.scope_domain,
-                        scope_excluded=args.scope_exclude)
+                        scope_excluded=args.scope_exclude,
+                        scope_enforced=not args.no_scope_check)
     if not args.quiet:
         c = truth["counts"]
         print(f"[+] recon_truth.json: {Path(args.recon_dir) / 'recon_truth.json'} "

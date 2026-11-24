@@ -96,6 +96,7 @@ if str(_BUGHUNTER_DIR) not in sys.path:
 from tools.capability_registry import (  # noqa: E402
     CAPABILITIES,
     CapabilitySpec,
+    RTW_COMMIT_PIN,
     STATE_NATIVE,
     STATE_RTW_AVAILABLE,
     STATE_RTW_MISSING_DEPS,
@@ -746,6 +747,24 @@ def _unbridge_recon_dir(link: Optional[Path], backup: Optional[Path],
         pass
 
 
+def _rtw_head_commit() -> Optional[str]:
+    """`git rev-parse HEAD` of the RTW checkout, or None when it is not a git
+    repo / git is unavailable (unknown commit is NOT a mismatch — only a
+    verifiably different HEAD blocks delegation). Cheap (<50ms), run before
+    every delegated subprocess."""
+    repo = rtw_home()
+    if not (repo / ".git").is_dir():
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=15, shell=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    head = (proc.stdout or "").strip()
+    return head if head else None
+
+
 def run_capability(capability_id: str, target: str,
                    recon_dir: Optional[Path] = None,
                    scope_domains: Optional[List[str]] = None,
@@ -769,6 +788,11 @@ def run_capability(capability_id: str, target: str,
     digest = input_hash(spec, target, recon_dir)
 
     # Step 2 — native guard: never delegate what ABH owns.
+    # RESERVED (B8): NATIVE_CAPABILITY_IDS is an empty frozenset today, so no
+    # shipped capability ever takes this branch — it is deliberate dead code,
+    # kept as the spec-drift safety net: if a future registry version marks a
+    # capability NATIVE in capabilities.json, this guard refuses to delegate
+    # it (documented by tests/test_rtw_capability.py's native-skip test).
     state_map = load_state()
     if state_map.get(capability_id) == STATE_NATIVE:
         return _result(RESULT_SKIPPED, capability_id, target, digest=digest,
@@ -821,6 +845,22 @@ def run_capability(capability_id: str, target: str,
     if not rtw_script().is_file():
         return _result(RESULT_SKIPPED, capability_id, target, digest=digest,
                        reason=f"RTW_HOME/reconftw.sh not found at {rtw_home()} — RTW_HOME unset behaves as upstream ABH")
+
+    # Run-time pin re-verification: the registry and doctor only check the
+    # pin at install/doctor time — a moved or rebased reconFTW checkout must
+    # never run unpinned delegated code. On a verifiable HEAD != pin mismatch
+    # the delegation is refused (SKIPPED) and the refusal is recorded on the
+    # manifest so tool_health surfaces it.
+    pin_head = _rtw_head_commit()
+    if pin_head is not None and pin_head != RTW_COMMIT_PIN:
+        reason = (f"pin mismatch: RTW HEAD {pin_head} != pinned {RTW_COMMIT_PIN} "
+                  f"— refusing to delegate (re-clone or update the pin)")
+        entry = _entry(spec, target_host, digest, RESULT_SKIPPED, _utcnow(),
+                       reason=reason)
+        upsert_entry(manifest, entry)
+        save_manifest(target, manifest)
+        return _result(RESULT_SKIPPED, capability_id, target, digest=digest,
+                       reason=reason, entry=entry)
 
     # ── Execute ────────────────────────────────────────────────────────────
     root = workdir_root or (recon_dir / "rtw" / ".work")

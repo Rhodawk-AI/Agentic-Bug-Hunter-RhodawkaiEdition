@@ -114,7 +114,7 @@ Confirm that out-of-scope targets are aborted before any tool runs or any packet
 rhodawk evil.example -recon --scope-domain "*.goodscope.example"
 ```
 
-**Expected result:** Immediate scope block (`0` packets sent, `0` tools spawned).
+**Expected result:** Immediate scope block — `0` packets sent **to the blocked target** and `0` tools spawned. (Discovered hosts are filtered before probing too; `--no-scope-check` disables scoping entirely.)
 
 ### Test 2: Run Live Scoped Recon on an Authorized Public Target
 
@@ -128,7 +128,10 @@ rhodawk rest.vulnweb.com -recon --scope-domain "rest.vulnweb.com"
 
 ### Test 3: Inspect the 3 Structured Artifacts
 
-Outputs are written to `bughunter/recon/<target>/`:
+Outputs are written to the recon dir for the target — `<host>` or `<host>_<port>` when the target carries an explicit port. The location depends on the install layout (verified with real `engine.py recon` runs):
+
+- **Writable git clone** (default): `<clone>/bughunter/recon/<target>/`
+- **pipx / read-only install, or when `BUGHUNTER_HOME` is set**: `$BUGHUNTER_HOME/recon/<target>/` (default `~/.bughunter/recon/<target>/`)
 
 ```bash
 RECON_DIR=~/Agentic-Bug-Hunter-RhodawkaiEdition/bughunter/recon/rest.vulnweb.com
@@ -168,7 +171,7 @@ cat "$RECON_DIR/recon_brief.md"
 | :--- | :--- | :--- |
 | **`error: externally-managed-environment` (PEP 668)** | Ran global `pip install` on Ubuntu 24.04 / Debian 12 / Kali. | Use `pipx install agentic-bug-hunter-rhodawkai-edition`. |
 | **Immediate `SCOPE BLOCK` error** | Fail-closed safety gate working as designed because no scope pattern was supplied. | Pass `--scope-domain "<target>"` (or `--no-scope-check` strictly for local Docker labs). |
-| **Duplicate / identical results across localhost Docker apps** | Recon normalizes targets by hostname (`127.0.0.1`), so `127.0.0.1:8082` and `127.0.0.1:8083` overwrite `bughunter/recon/127.0.0.1/`. | Benchmark distinct authorized domains (`rest.vulnweb.com`, `scanme.nmap.org`), or wipe `bughunter/recon/127.0.0.1` between single-container local runs. |
+| **Two ports on one host** | Fixed in 6.1.1.1: `127.0.0.1:8082` and `127.0.0.1:8083` now key separate recon dirs (`bughunter/recon/127.0.0.1_8082/` vs `..._8083/`); each run also archives the previous run to `.prev_run/` so stale artifacts never leak into a Summary. | Nothing to do — but only the data-home mirror (`~/.bughunter/recon/<host>/recon_truth.json`) stays host-keyed by design. |
 | **`[WARN]` in `doctor` or `SKIPPED_SILENT` / `COMPLETED_EMPTY` in `tool_health`** | Honest telemetry reporting optional API keys or reconFTW modules that returned zero net-new items. | Ignore unless `[FAIL]` appears in `rhodawk doctor`. Export `PDCP_API_KEY` only if you need ASN enumeration. |
 | **AI brief hangs or takes 10+ minutes** | Local Ollama running on a CPU-only VPS. | Switch to cloud inference: `rhodawk setup --provider nvidia` (or `groq`). |
 | **`rhodawk` installed, but `doctor` fails on binaries / Chromium** | Installed only the PyPI/npm CLI without running the toolchain scripts. | Run `./install.sh --agent standalone && bash install_tools.sh --rtw-deps && bash install_tools.sh --browser`. |

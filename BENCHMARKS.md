@@ -80,3 +80,18 @@ On a Vercel-hosted CDN domain (`rhodawkai.com`, verified on the same VPS on `202
 
 - **`Live hosts: 0` on `testphp` & `testhtml5`:** Both RhodawkAI Edition and Original ABH recorded `Live hosts: 0` during HTTP probing on `testphp.vulnweb.com` and `testhtml5.vulnweb.com` while still collecting historical/archived URLs.
 - **Transparent Telemetry (`SKIPPED_SILENT`):** RhodawkAI Edition's `tool_health` checker surfaced an upstream `reconFTW` subshell error (`/root/Tools/reconftw/modules/utils.sh: line 1493: _is_behind_nat: command not found`) rather than silently ignoring it—tracked for a clean fix in `v6.1.2`.
+
+---
+
+## Limitations
+
+Honest accounting of what this benchmark does NOT establish:
+
+- **Single run per cell.** Every number above is one timed run — there is no variance data (no repeated runs, no confidence intervals). Wall-clock deltas smaller than run-to-run noise should be treated as noise.
+- **The fork ran scoped and the original unscoped**, so the subdomain counts are **not comparable** (`1 (scoped)` vs `44 (unscoped)` on `testphp.vulnweb.com` reflects scope filtering, not worse discovery).
+- **The fork was slower on 3 of the 5 targets** (`testhtml5` +13.5%, `rest` +16.8%, `scanme.nmap.org` +2.3%); the total is faster only because of `testphp` and `testaspnet`.
+- **`reconFTW -r` was attempted on target 1 only** — "0/5" should read **"DNF on target 1; not attempted on 2–5"** (it stalled in OSINT/`sub_brute` past the 30-minute ceiling).
+- **`Live hosts: 0` on `testphp`/`testhtml5` for BOTH tools is unexplained** — both stacks collected historical URLs but probed no live hosts; no root cause was identified in this benchmark window.
+- **The CDN-skip savings are a single run on one target** (`rhodawkai.com`: `104.79s` port-scan time on the Vercel edge vs `0s`), not a measured average across targets.
+
+No measured number above was edited or invented when adding this section.

@@ -98,6 +98,22 @@ done
 [ -n "$TARGET" ] || { _rtw_engine_usage >&2; exit 1; }
 BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Flatten (repeatable + comma-separated) scope patterns ONCE — used by the
+# pre-flight scope gate AND the B2 redirect-destination classification.
+SC_CHECK_ARGS=()
+for _p in ${SCOPE_DOMAIN_ARGS[@]+"${SCOPE_DOMAIN_ARGS[@]}"}; do
+    IFS=',' read -r -a _sc_parts <<< "$_p"
+    for _c in "${_sc_parts[@]}"; do
+        [ -n "$_c" ] && SC_CHECK_ARGS+=(--domain "$_c")
+    done
+done
+for _p in ${SCOPE_EXCLUDE_ARGS[@]+"${SCOPE_EXCLUDE_ARGS[@]}"}; do
+    IFS=',' read -r -a _sc_parts <<< "$_p"
+    for _c in "${_sc_parts[@]}"; do
+        [ -n "$_c" ] && SC_CHECK_ARGS+=(--exclude-domain "$_c")
+    done
+done
+
 # ── reconFTW gap-fill plumbing (RhodawkAI Edition, Fixes 1+2) ─────────────────
 # Deterministic delegation to reconFTW's equivalent functions via
 # tools/rtw_adapter.py — never an LLM judgment call. Two split phases:
@@ -127,6 +143,57 @@ _rtw_run_phase() {
     _rtw_ready || return 1
     python3 "$RTW_ADAPTER" phase "$1" --target "$TARGET" --recon-dir "$RECON_DIR" \
         ${RTW_SCOPE_ARGS[@]+"${RTW_SCOPE_ARGS[@]}"}
+}
+
+# ── B3: post-enumeration scope filter ────────────────────────────────────
+# Hosts/URLs discovered by subfinder/crt.sh/wayback/katana/gau or the
+# reconFTW gap-fill are filtered through the SAME ScopeChecker rules as the
+# pre-flight gate BEFORE any probing tool reads them. Dropped lines are
+# written to <recon_dir>/scope/dropped_oos.txt (prefixed with their source
+# file); the dropped total lands in the Recon Summary and in recon_truth.json
+# (counts.scope_dropped). No-op when --no-scope-check is passed; patternless
+# targets self-scope to the target itself (ip/local/cidr); list targets are
+# pre-resolved scope lists, so they are left untouched.
+SCOPE_DROPPED_TOTAL=0
+_abh_scope_filter() {
+    [ "$SCOPE_OPT_OUT" = "1" ] && return 0
+    local _f="$1"
+    [ -f "$_f" ] || return 0
+    [ -s "$_f" ] || return 0
+    local _filter_args=()
+    if [ ${#SCOPE_DOMAIN_ARGS[@]} -gt 0 ]; then
+        _filter_args=("${SC_CHECK_ARGS[@]}")
+    else
+        case "$(printf '%s' "${TARGET_TYPE:-}" | tr -d '[:space:]')" in
+            ip|local|cidr) _filter_args=(--domain "$TARGET") ;;
+            *) return 0 ;;
+        esac
+    fi
+    mkdir -p "$RECON_DIR/scope"
+    local _rel="${_f#$RECON_DIR/}"
+    local _tmp_in="$RECON_DIR/scope/.filter_in.txt"
+    local _tmp_drop="$RECON_DIR/scope/.filter_dropped.txt"
+    cp "$_f" "$_tmp_in" 2>/dev/null || return 0
+    if python3 "$BASE_DIR/tools/scope_checker.py" \
+            ${_filter_args[@]+"${_filter_args[@]}"} \
+            --input-file "$_tmp_in" --output "$_f" \
+            --dropped-file "$_tmp_drop" >/dev/null 2>&1; then
+        if [ -s "$_tmp_drop" ]; then
+            local _n
+            _n=$(grep -c . "$_tmp_drop" 2>/dev/null || echo 0)
+            while IFS= read -r _oos_line; do
+                [ -z "$_oos_line" ] && continue
+                printf '%s\t%s\n' "$_rel" "$_oos_line" >> "$RECON_DIR/scope/dropped_oos.txt"
+            done < "$_tmp_drop"
+            SCOPE_DROPPED_TOTAL=$((SCOPE_DROPPED_TOTAL + _n))
+            log_info "Scope filter: dropped $_n out-of-scope line(s) from $_rel (scope/dropped_oos.txt)"
+        fi
+    else
+        # The checker itself failed — never silently probe unfiltered data.
+        cp "$_tmp_in" "$_f" 2>/dev/null || true
+        log_warn "Scope filter FAILED for $_rel — file left UNFILTERED (checker error); investigate python3 tools/scope_checker.py"
+    fi
+    rm -f "$_tmp_in" "$_tmp_drop"
 }
 
 # Auth-aware hunting: load BBHUNT_AUTH_HEADERS / BBHUNT_SESSION_ID into
@@ -189,7 +256,16 @@ if [ "${TARGET_TYPE:-}" != "list" ] && [ "${TARGET_TYPE:-}" != "cidr" ] \
     _normalize_target "$TARGET"
 fi
 
-RECON_DIR="${RECON_OUT_DIR:-$BASE_DIR/recon/$TARGET}"
+# C10: host:port targets key their own recon dir (127.0.0.1:8082 ->
+# 127.0.0.1_8082) so two ports on one host never overwrite each other's
+# artifacts. RECON_OUT_DIR is pinned by engine.py (which keys it the same
+# way via target_normalize.recon_dirname); the standalone-shell default keys
+# host_port here. Portless targets keep today's bare-host path.
+if [ -n "${RECON_OUT_DIR:-}" ]; then
+    RECON_DIR="$RECON_OUT_DIR"
+else
+    RECON_DIR="$BASE_DIR/recon/$TARGET${TARGET_PORT:+_$TARGET_PORT}"
+fi
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 THREADS="${BB_THREADS:-50}"
 RATE_LIMIT="${BB_RATE_LIMIT:-150}"  # requests per second
@@ -304,21 +380,6 @@ elif [ "$TARGET_TYPE" != "domain" ]; then
 elif [ ${#SCOPE_DOMAIN_ARGS[@]} -eq 0 ]; then
     SCOPE_GATE_BLOCK="no --scope-domain pattern provided (fail-closed pre-flight gate)"
 else
-    SC_CHECK_ARGS=()
-    # Repeatable and comma-separated patterns are both accepted (same
-    # flattening the rtw_adapter applies before its own ScopeChecker call).
-    for _p in ${SCOPE_DOMAIN_ARGS[@]+"${SCOPE_DOMAIN_ARGS[@]}"}; do
-        IFS=',' read -r -a _sc_parts <<< "$_p"
-        for _c in "${_sc_parts[@]}"; do
-            [ -n "$_c" ] && SC_CHECK_ARGS+=(--domain "$_c")
-        done
-    done
-    for _p in ${SCOPE_EXCLUDE_ARGS[@]+"${SCOPE_EXCLUDE_ARGS[@]}"}; do
-        IFS=',' read -r -a _sc_parts <<< "$_p"
-        for _c in "${_sc_parts[@]}"; do
-            [ -n "$_c" ] && SC_CHECK_ARGS+=(--exclude-domain "$_c")
-        done
-    done
     if ! python3 "$BASE_DIR/tools/scope_checker.py" \
             ${SC_CHECK_ARGS[@]+"${SC_CHECK_ARGS[@]}"} "$TARGET" >/dev/null 2>&1; then
         SCOPE_GATE_BLOCK="target '$TARGET' is outside the provided scope patterns"
@@ -371,6 +432,30 @@ if ! "$HTTPX_BIN" -version 2>&1 | grep -qi "projectdiscovery"; then
     dep_install_hint httpx >&2
 fi
 export HTTPX_BIN
+
+# ── B5: run isolation — archive the previous run, wipe stale artifacts ──────
+# A re-run in the same recon dir used to mix old artifacts into the new
+# Summary (a dead httpx still reported run 1's live hosts). Archive the
+# previous truth (the delta baseline) under .prev_run/ and clear everything
+# else, so every Summary value counts the CURRENT run only. The previous
+# truth stays available to recon_fusion.py via .prev_run/recon_truth.json.
+if [ -d "$RECON_DIR" ] && [ -n "$(ls -A "$RECON_DIR" 2>/dev/null)" ]; then
+    mkdir -p "$RECON_DIR/.prev_run"
+    # B6: a leftover .run_incomplete marker means the previous run never
+    # reached a clean exit (killed watchdog, crashed phase) — warn and archive
+    # it so fuse records previous_run_incomplete=true in this run's truth.
+    if [ -f "$RECON_DIR/.run_incomplete" ]; then
+        log_warn "Previous recon run for $TARGET did not complete cleanly — artifacts archived to .prev_run; previous_run_incomplete will be recorded"
+        mv -f "$RECON_DIR/.run_incomplete" "$RECON_DIR/.prev_run/run_incomplete"
+    fi
+    [ -f "$RECON_DIR/recon_truth.json" ] && \
+        mv -f "$RECON_DIR/recon_truth.json" "$RECON_DIR/.prev_run/recon_truth.json"
+    find "$RECON_DIR" -mindepth 1 -maxdepth 1 -not -name '.prev_run' \
+        -exec rm -rf {} + 2>/dev/null || true
+fi
+
+# B6: mark this run incomplete until a clean exit removes the marker.
+touch "$RECON_DIR/.run_incomplete"
 
 mkdir -p "$RECON_DIR"/{subdomains,live,ports,urls,js,dirs,params}
 
@@ -544,6 +629,9 @@ log_ok "Seed host included; probe list now: $TOTAL_SUBS host(s)"
 
 fi  # end of domain-only subdomain enum block
 
+# B3 filter point 1/4: after the Phase 1 merge, BEFORE httpx reads all.txt.
+_abh_scope_filter "$RECON_DIR/subdomains/all.txt"
+
 # ============================================================
 # Phase 1.5: reconFTW Subdomain/Infra Gap-Fill (RhodawkAI Edition)
 # ASN/CIDR enum, DNS permutation, CDN/origin isolation — delegated to
@@ -578,6 +666,10 @@ if _rtw_ready; then
 else
     log_step "reconFTW gap-fill not configured (RTW_HOME unset) — skipping (upstream behavior)"
 fi
+
+# B3 filter point 2/4: after the Phase 1.5 merge (gap-fill output was already
+# post-call filtered by the adapter; this re-checks the merged probe list).
+_abh_scope_filter "$RECON_DIR/subdomains/all.txt"
 
 # ============================================================
 # Phase 2: HTTP Probing
@@ -626,6 +718,65 @@ if [ -x "$HTTPX_BIN" ] && [ -s "$RECON_DIR/subdomains/all.txt" ]; then
     log_done "3xx Redirect: $(wc -l < "$RECON_DIR/live/status_3xx.txt" 2>/dev/null || echo 0)"
     log_done "403 Forbidden: $(wc -l < "$RECON_DIR/live/status_403.txt" 2>/dev/null || echo 0)"
     log_done "401 Auth Required: $(wc -l < "$RECON_DIR/live/status_401.txt" 2>/dev/null || echo 0)"
+
+    # B2: when scoped, httpx no longer follows redirects blindly (above). A
+    # redirect destination is RECORDED as a finding in live/redirects.txt and
+    # probed ONLY if it is in scope: the Location is read with an in-scope
+    # HEAD request (curl, bounded), classified through the same scope rules
+    # as every other asset, and only in-scope destinations enter a bounded
+    # second httpx pass. Out-of-scope destinations are never fetched.
+    if [ "${SCOPE_ENFORCED:-0}" = "1" ] && [ -s "$RECON_DIR/live/status_3xx.txt" ] \
+       && command -v curl &>/dev/null; then
+        log_step "Scoped redirect handling: recording destinations (no blind follow)..."
+        : > "$RECON_DIR/live/redirects.txt"
+        : > "$RECON_DIR/live/redirects_inscope.txt"
+        _redir_n=0
+        while IFS= read -r _line && [ "$_redir_n" -lt 50 ]; do
+            _url=$(printf '%s' "$_line" | awk '{print $1}')
+            [ -z "$_url" ] && continue
+            _loc=$(curl -sI --max-time 5 ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} "$_url" 2>/dev/null \
+                | awk 'tolower($1)=="location:"{sub(/\r$/,"",$2); print $2; exit}')
+            [ -z "$_loc" ] && continue
+            _dest_host=$(printf '%s' "$_loc" | sed 's|https\?://||;s|[/:].*||')
+            _dest_port=$(printf '%s' "$_loc" | sed -nE 's|https?://[^/]*:([0-9]+).*|\1|p')
+            _in_scope=0
+            if [ ${#SCOPE_DOMAIN_ARGS[@]} -gt 0 ]; then
+                python3 "$BASE_DIR/tools/scope_checker.py" \
+                    ${SC_CHECK_ARGS[@]+"${SC_CHECK_ARGS[@]}"} "$_loc" >/dev/null 2>&1 && _in_scope=1
+            else
+                # Self-scoped target: the destination host must match the
+                # target host — and when the target carries an explicit port
+                # (host:port lab target), the destination must use that port.
+                if [ "$_dest_host" = "$TARGET" ]; then
+                    if [ -n "$TARGET_PORT" ]; then
+                        [ "$_dest_port" = "$TARGET_PORT" ] && _in_scope=1
+                    else
+                        _in_scope=1
+                    fi
+                fi
+            fi
+            if [ "$_in_scope" = "1" ]; then
+                printf '[IN-SCOPE] %s <- redirect from %s\n' "$_loc" "$_url" >> "$RECON_DIR/live/redirects.txt"
+                printf '%s\n' "$_loc" >> "$RECON_DIR/live/redirects_inscope.txt"
+            else
+                printf '[OOS] %s <- redirect from %s (recorded, NOT probed)\n' "$_loc" "$_url" >> "$RECON_DIR/live/redirects.txt"
+                log_info "Redirect destination out of scope — recorded, not probed: $_loc"
+            fi
+            _redir_n=$((_redir_n + 1))
+        done < "$RECON_DIR/live/status_3xx.txt"
+        if [ -s "$RECON_DIR/live/redirects_inscope.txt" ]; then
+            log_step "Probing in-scope redirect destinations only..."
+            sort -u -o "$RECON_DIR/live/redirects_inscope.txt" "$RECON_DIR/live/redirects_inscope.txt"
+            "$HTTPX_BIN" -l "$RECON_DIR/live/redirects_inscope.txt" \
+                -silent -status-code -threads "$THREADS" -rate-limit "$RATE_LIMIT" \
+                ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} \
+                -o "$RECON_DIR/live/httpx_redirect_probe.txt" 2>/dev/null || true
+            [ -s "$RECON_DIR/live/httpx_redirect_probe.txt" ] && \
+                cat "$RECON_DIR/live/httpx_redirect_probe.txt" >> "$RECON_DIR/live/httpx_full.txt"
+            awk '{print $1}' "$RECON_DIR/live/httpx_full.txt" 2>/dev/null | sort -u > "$RECON_DIR/live/urls.txt" || true
+            LIVE_COUNT=$(wc -l < "$RECON_DIR/live/urls.txt" 2>/dev/null || echo 0)
+        fi
+    fi
 else
     if ! [ -x "$HTTPX_BIN" ]; then
         warn_missing httpx "HTTP probing"
@@ -801,6 +952,9 @@ fi
 cat "$RECON_DIR/urls/"*.txt 2>/dev/null | sort -u > "$RECON_DIR/urls/all.txt" 2>/dev/null || true
 log_done "Total unique URLs: $(wc -l < "$RECON_DIR/urls/all.txt" 2>/dev/null || echo 0)"
 
+# B3 filter point 3/4: after the Phase 4 URL collection merge (gau/katana).
+_abh_scope_filter "$RECON_DIR/urls/all.txt"
+
 # Filter interesting URLs
 if [ -s "$RECON_DIR/urls/all.txt" ]; then
     # URLs with parameters (potential injection points)
@@ -885,6 +1039,10 @@ if _rtw_ready; then
 else
     log_step "reconFTW gap-fill not configured (RTW_HOME unset) — skipping (upstream behavior)"
 fi
+
+# B3 filter point 4/4: after the Phase 5.5 merge (before Phase 6 fuzzing and
+# the Summary read the URL corpus).
+_abh_scope_filter "$RECON_DIR/urls/all.txt"
 
 # ============================================================
 # Phase 6: Directory Fuzzing
@@ -1145,11 +1303,20 @@ fi
 echo ""
 log_info "Canonical Fusion (recon_truth.json)"
 if command -v python3 &>/dev/null && [ -f "$BASE_DIR/tools/recon_fusion.py" ]; then
-    python3 "$BASE_DIR/tools/recon_fusion.py" fuse --recon-dir "$RECON_DIR" --target "$TARGET" \
-        ${RTW_SCOPE_ARGS[@]+"${RTW_SCOPE_ARGS[@]}"} \
-        || log_warn "recon fusion failed (non-fatal — raw artifacts remain the fallback)"
+    if python3 "$BASE_DIR/tools/recon_fusion.py" fuse --recon-dir "$RECON_DIR" --target "$TARGET" \
+        ${RTW_SCOPE_ARGS[@]+"${RTW_SCOPE_ARGS[@]}"} ; then
+        :
+    else
+        _fuse_rc=$?
+        # B1: a failed fusion is never swallowed silently — visible warning
+        # plus a FAILED FUSION row in rtw_manifest.json (surfaces in
+        # recon_truth.json tool_health and the health-table).
+        log_err "CANONICAL FUSION FAILED (exit $_fuse_rc) — recon_truth.json/delta.json were NOT regenerated this run; raw artifacts remain the fallback"
+        python3 "$BASE_DIR/tools/recon_fusion.py" mark-failed --target "$TARGET" \
+            --reason "fuse failed (exit $_fuse_rc) in recon_engine.sh" >/dev/null 2>&1 || true
+    fi
 else
-    log_warn "python3 / recon_fusion.py unavailable — skipping canonical fusion"
+    log_err "python3 / recon_fusion.py unavailable — canonical fusion SKIPPED (no recon_truth.json this run)"
 fi
 
 # ============================================================
@@ -1162,12 +1329,10 @@ echo "  Completed: $(date)"
 echo "============================================="
 echo ""
 echo "  Subdomains:        $(wc -l < "$RECON_DIR/subdomains/all.txt" 2>/dev/null || echo 0)"
-[ -f "$RECON_DIR/live/urls.txt" ] && \
 echo "  Live hosts:        $(wc -l < "$RECON_DIR/live/urls.txt" 2>/dev/null || echo 0)"
+echo "  URLs collected:    $(wc -l < "$RECON_DIR/urls/all.txt" 2>/dev/null || echo 0)"
 [ -f "$RECON_DIR/ports/open_ports.txt" ] && \
 echo "  Open ports:        $(wc -l < "$RECON_DIR/ports/open_ports.txt" 2>/dev/null || echo 0)"
-[ -f "$RECON_DIR/urls/all.txt" ] && \
-echo "  URLs collected:    $(wc -l < "$RECON_DIR/urls/all.txt" 2>/dev/null || echo 0)"
 [ -f "$RECON_DIR/urls/with_params.txt" ] && \
 echo "  Parameterized:     $(wc -l < "$RECON_DIR/urls/with_params.txt" 2>/dev/null || echo 0)"
 [ -f "$RECON_DIR/urls/api_endpoints.txt" ] && \
@@ -1198,6 +1363,7 @@ done
 echo "  Probe list (post gap-fill): $(wc -l < "$RECON_DIR/subdomains/all.txt" | tr -d ' ') subdomains"
 [ -f "$RECON_DIR/urls/all.txt" ] && \
 echo "  URL corpus (post gap-fill): $(wc -l < "$RECON_DIR/urls/all.txt" | tr -d ' ') urls"
+echo "  Scope-filtered (dropped OOS): $SCOPE_DROPPED_TOTAL line(s) (scope/dropped_oos.txt)"
 
 # Step 2C: 1-line run-over-run delta summary.
 if [ -f "$RECON_DIR/delta.json" ]; then
@@ -1225,3 +1391,8 @@ echo "    ./tools/vuln_scanner.sh $RECON_DIR        # active vuln probes"
 echo "    ./tools/takeover_scanner.sh --recon $RECON_DIR   # confirm CNAME takeovers"
 echo "    ./tools/secrets_hunter.sh --js-bundle $RECON_DIR  # leaked-cred sweep"
 echo "============================================="
+
+# B6: clean exit — remove the run-incomplete marker so the next run does not
+# report previous_run_incomplete. If the engine is killed before this point
+# the marker survives and the next run records + warns about the interruption.
+rm -f "$RECON_DIR/.run_incomplete"

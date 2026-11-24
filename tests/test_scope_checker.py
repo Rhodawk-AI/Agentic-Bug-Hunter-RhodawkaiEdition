@@ -234,3 +234,34 @@ class TestScopeCheckerCli:
         err = capsys.readouterr().err
         assert exc.value.code == 2
         assert "No such file or directory" in err
+
+
+class TestConstrainedPatternWarnings:
+    """Scope-pattern UX: allow patterns carrying a :port or /path constraint
+    can never match the host-level checks (pre-flight gate, adapter target
+    check, bare-host/URL filtering) — they used to fail closed SILENTLY.
+    Construction must emit an explicit warning naming the pattern and why."""
+
+    def test_port_constrained_allow_pattern_warns(self, capsys):
+        ScopeChecker(domains=["app.example.test:8443"])
+        err = capsys.readouterr().err
+        assert "app.example.test:8443" in err
+        assert "port" in err.lower()
+        assert "fail" in err.lower() or "never match" in err.lower()
+
+    def test_path_constrained_allow_pattern_warns(self, capsys):
+        ScopeChecker(domains=["app.example.test/admin"])
+        err = capsys.readouterr().err
+        assert "app.example.test/admin" in err
+        assert "path" in err.lower()
+
+    def test_unconstrained_pattern_does_not_warn(self, capsys):
+        ScopeChecker(domains=["app.example.test", "*.example.test"])
+        err = capsys.readouterr().err
+        assert "WARNING" not in err
+
+    def test_constrained_exclusion_pattern_warns(self, capsys):
+        ScopeChecker(domains=["*.example.test"],
+                     excluded_domains=["blog.example.test:8443"])
+        err = capsys.readouterr().err
+        assert "blog.example.test:8443" in err

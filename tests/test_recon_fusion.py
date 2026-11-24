@@ -61,6 +61,8 @@ def recon_dir(tmp_path):
     write(rd, "ports/nmap_greppable.txt",
           "Host: 93.184.216.34 () Ports: 80/open/tcp//http///, "
           "443/open/tcp//https///\n")
+    write(rd, "hosts/resolution.txt",
+          "t.example.com\t93.184.216.34\t\n")
     write(rd, "urls/gau.txt",
           "https://t.example.com/blog?page=2&utm_source=feed\n")
     write(rd, "urls/katana.txt",
@@ -301,7 +303,7 @@ class TestFuse:
         # one cluster; cdn differs → second cluster.
         assert c["unique_host_clusters"] == 2
         assert c["cdn_edges"] == 1
-        assert c["origin_ips"] == 0          # no resolution evidence ingested
+        assert c["origin_ips"] == 1          # t.example.com -> 93.184.216.34
         assert c["open_ports"] == 2
         assert c["js_endpoints"] == 2
         # URL canonicalization: utm stripped; page=2 vs page=3 collapse on the
@@ -333,8 +335,11 @@ class TestFuse:
         # JS endpoints + ports carry provenance.
         assert {e["endpoint"] for e in truth["js_endpoints"]} == \
             {"/api/v1/users", "/static/app.js"}
+        assert truth["ports"][0]["host"] == "t.example.com"
         assert truth["ports"][0]["port"] == 80
+        assert truth["ports"][0]["nmap_host"] == "93.184.216.34"
         assert truth["ports"][0]["discovered_by"] == ["ports/nmap_greppable.txt"]
+        assert truth["unattributed_ports"] == []
         assert delta["has_previous_run"] is False
 
     def test_tool_health_from_manifest(self, recon_dir, isolated_home):
@@ -380,7 +385,7 @@ class TestFuse:
         assert delta["removed_subdomains"] == []
         assert {"host": "t.example.com", "from": 200, "to": 403} in \
             delta["status_code_flips"]
-        assert delta["new_open_ports"] == [{"host": "93.184.216.34",
+        assert delta["new_open_ports"] == [{"host": "t.example.com",
                                             "port": 8443}]
         prev = json.loads((recon_dir / "recon_truth.prev.json").read_text())
         assert prev["counts"]["open_ports"] == 2
@@ -409,3 +414,185 @@ class TestClassifyCommand:
         assert rc == 0
         assert (recon_dir / "hosts" / "host_classes.txt").is_file()
         assert rf.main(["delta-line", "--recon-dir", str(recon_dir)]) == 0
+
+
+class TestFusionScopeOptOutAndHealth:
+    """B1 regression: `--no-scope-check` must not kill canonical fusion, the
+    truth must record scope_enforced, and fuse failures must never be
+    swallowed silently (tool_health FUSION=FAILED)."""
+
+    def test_fuse_cli_accepts_no_scope_check_and_records_false(
+            self, recon_dir, isolated_home):
+        rc = rf.main(["fuse", "--recon-dir", str(recon_dir),
+                      "--target", "t.example.com", "--no-scope-check"])
+        assert rc == 0
+        truth = json.loads((recon_dir / "recon_truth.json").read_text())
+        assert truth["scope_enforced"] is False
+        assert (recon_dir / "delta.json").is_file()
+
+    def test_fuse_records_scope_enforced_true_by_default(
+            self, recon_dir, isolated_home):
+        assert rf.main(["fuse", "--recon-dir", str(recon_dir),
+                        "--target", "t.example.com"]) == 0
+        truth = json.loads((recon_dir / "recon_truth.json").read_text())
+        assert truth["scope_enforced"] is True
+
+    def test_mark_failed_records_fusion_failed_in_tool_health(
+            self, recon_dir, isolated_home):
+        rc = rf.main(["mark-failed", "--target", "t.example.com",
+                      "--reason", "fuse exploded"])
+        assert rc == 0
+        truth = rf.build_truth(recon_dir, "t.example.com")
+        fusion = [h for h in truth["tool_health"]
+                  if h["capability_id"] == "FUSION"]
+        assert fusion and fusion[0]["status"] == "FAILED"
+        assert "fuse exploded" in fusion[0]["reason"]
+
+    def test_successful_fuse_clears_stale_fusion_failed_entry(
+            self, recon_dir, isolated_home):
+        rf.main(["mark-failed", "--target", "t.example.com", "--reason", "x"])
+        rf.main(["fuse", "--recon-dir", str(recon_dir),
+                 "--target", "t.example.com"])
+        manifest = json.loads(
+            (isolated_home / "recon" / "t.example.com" / "rtw_manifest.json")
+            .read_text())
+        assert all(e.get("capability_id") != "FUSION"
+                   for e in manifest.get("entries", []))
+
+
+class TestPortAttribution:
+    """B4 regression: open ports are attributed ONLY to hosts they can be
+    joined to — the nmap target hostname itself, or an IP that exactly ONE
+    host resolves to (hosts/resolution.txt). Anything unjoinable (hostless
+    open_ports.txt fallback rows, shared/ambiguous IPs like the E9 loopback)
+    goes to truth['unattributed_ports'] and must never surface as a port on
+    oos.example.test."""
+
+    @staticmethod
+    def _dir(tmp_path, greppable, resolution="", open_ports=""):
+        rd = tmp_path / "recon" / "t.example.com"
+        for sub in ("subdomains", "live", "ports", "urls", "js", "hosts"):
+            (rd / sub).mkdir(parents=True, exist_ok=True)
+        (rd / "subdomains" / "all.txt").write_text("t.example.com\n")
+        (rd / "live" / "httpx_full.txt").write_text(
+            "https://t.example.com [200] [Example Home] [nginx] [2048]\n")
+        if greppable:
+            (rd / "ports" / "nmap_greppable.txt").write_text(greppable)
+        if resolution:
+            (rd / "hosts" / "resolution.txt").write_text(resolution)
+        if open_ports:
+            (rd / "ports" / "open_ports.txt").write_text(open_ports)
+        return rd
+
+    def test_ip_with_single_resolving_host_is_attributed(self, tmp_path):
+        rd = self._dir(tmp_path,
+                       "Host: 10.0.0.15 () Ports: 80/open/tcp//http//stub-tech/\n",
+                       resolution="app2.t.example.com\t10.0.0.15\t\n")
+        truth, _ = rf.fuse(rd, "t.example.com")
+        assert truth["ports"] == [{
+            "host": "app2.t.example.com", "port": 80, "protocol": "tcp",
+            "service": "http", "nmap_host": "10.0.0.15",
+            "discovered_by": ["ports/nmap_greppable.txt"]}]
+        assert truth["unattributed_ports"] == []
+        assert truth["counts"]["open_ports"] == 1
+
+    def test_e9_shared_ip_never_borrows_ports(self, tmp_path):
+        """The E9 defect: 127.0.0.1 hosts several lab names (one of them
+        oos.example.test). Port 80 discovered on the shared loopback IP must
+        land in unattributed_ports — NOT on oos.example.test."""
+        rd = self._dir(tmp_path,
+                       "Host: 127.0.0.1 () Ports: 80/open/tcp//http//stub-tech/\n",
+                       resolution="app.t.example.com\t127.0.0.1\t\n"
+                                  "oos.example.test\t127.0.0.1\t\n"
+                                  "localhost\t127.0.0.1\t\n")
+        truth, _ = rf.fuse(rd, "t.example.com")
+        assert all(p["host"] != "oos.example.test" for p in truth["ports"])
+        assert all(p.get("host") != "oos.example.test"
+                   for p in truth["unattributed_ports"])
+        assert truth["ports"] == []
+        assert len(truth["unattributed_ports"]) == 1
+        row = truth["unattributed_ports"][0]
+        assert row["port"] == 80 and row["source_host"] == "127.0.0.1"
+        assert truth["counts"]["open_ports"] == 0
+
+    def test_hostless_open_ports_fallback_is_unattributed(self, tmp_path):
+        rd = self._dir(tmp_path, greppable="", open_ports="80/open\n")
+        truth, _ = rf.fuse(rd, "t.example.com")
+        assert truth["ports"] == []
+        assert truth["unattributed_ports"] == [{
+            "port": 80, "protocol": "tcp", "service": "",
+            "source_host": "", "discovered_by": ["ports/open_ports.txt"]}]
+
+    def test_unmapped_ip_is_unattributed(self, tmp_path):
+        rd = self._dir(tmp_path,
+                       "Host: 203.0.113.9 () Ports: 8080/open/tcp//http//proxy/\n")
+        truth, _ = rf.fuse(rd, "t.example.com")
+        assert truth["ports"] == []
+        assert truth["unattributed_ports"][0]["port"] == 8080
+
+    def test_delta_never_reports_oos_host_ports(self, tmp_path):
+        """Across two runs, delta.json new_open_ports can never gain a row on
+        an ambiguous shared IP's host (the E9 delta leak)."""
+        rd = self._dir(tmp_path,
+                       "Host: 127.0.0.1 () Ports: 80/open/tcp//http//stub-tech/\n",
+                       resolution="oos.example.test\t127.0.0.1\t\n"
+                                  "app.t.example.com\t127.0.0.1\t\n")
+        truth1, delta1 = rf.fuse(rd, "t.example.com")
+        assert delta1["new_open_ports"] == []
+        (rd / "ports" / "nmap_greppable.txt").write_text(
+            "Host: 127.0.0.1 () Ports: 80/open/tcp//http//stub-tech/, "
+            "8443/open/tcp//https//\n")
+        _, delta2 = rf.fuse(rd, "t.example.com")
+        assert all(p["host"] != "oos.example.test"
+                   for p in delta2["new_open_ports"])
+        assert delta2["new_open_ports"] == []
+
+
+class TestInputIntegrity:
+    """B7 regression: recon_truth.json carries an input_integrity block (per
+    input file: ok / empty / missing / unparseable); any unparseable REQUIRED
+    input sets truth status DEGRADED with a visible warning; the exit code is
+    unchanged."""
+
+    def test_binary_garbage_degrades_status(self, recon_dir, isolated_home,
+                                            capsys):
+        (recon_dir / "live" / "httpx_full.txt").write_bytes(
+            b"\x00\x01\xff\xfe binary garbage \x00")
+        rc = rf.main(["fuse", "--recon-dir", str(recon_dir),
+                      "--target", "t.example.com"])
+        assert rc == 0  # exit code unchanged
+        truth = json.loads((recon_dir / "recon_truth.json").read_text())
+        assert truth["input_integrity"]["live/httpx_full.txt"] == "unparseable"
+        assert truth["status"] == rf.STATUS_DEGRADED
+        assert "DEGRADED" in capsys.readouterr().err
+
+    def test_nul_bytes_in_subdomain_list_unparseable(self, recon_dir,
+                                                     isolated_home):
+        (recon_dir / "subdomains" / "all.txt").write_bytes(
+            b"app\x00.lab.test\ngarbage line no tld\n")
+        rf.main(["fuse", "--recon-dir", str(recon_dir),
+                 "--target", "t.example.com"])
+        truth = json.loads((recon_dir / "recon_truth.json").read_text())
+        assert truth["input_integrity"]["subdomains/all.txt"] == "unparseable"
+        assert truth["status"] == rf.STATUS_DEGRADED
+
+    def test_empty_and_missing_inputs_are_not_degraded(self, recon_dir,
+                                                       isolated_home):
+        (recon_dir / "urls" / "all.txt").write_text("")
+        (recon_dir / "ports" / "nmap_greppable.txt").unlink()
+        rf.main(["fuse", "--recon-dir", str(recon_dir),
+                 "--target", "t.example.com"])
+        truth = json.loads((recon_dir / "recon_truth.json").read_text())
+        assert truth["input_integrity"]["urls/all.txt"] == "empty"
+        assert truth["input_integrity"]["ports/nmap_greppable.txt"] == "missing"
+        assert truth["status"] == rf.STATUS_OK
+
+    def test_clean_inputs_report_ok(self, recon_dir, isolated_home):
+        rf.main(["fuse", "--recon-dir", str(recon_dir),
+                 "--target", "t.example.com"])
+        truth = json.loads((recon_dir / "recon_truth.json").read_text())
+        assert truth["status"] == rf.STATUS_OK
+        assert set(truth["input_integrity"].values()) <= {
+            "ok", "empty", "missing"}
+        assert all(v != "unparseable"
+                   for v in truth["input_integrity"].values())

@@ -90,3 +90,18 @@ def test_shell_normalizer_matches_python(raw, ttype):
     if ttype != "cidr":  # CIDR is passed through unnormalized in the shell
         assert parsed.get("host") == py_host, f"{raw!r}: host mismatch"
         assert parsed.get("port", "") == (py_port or ""), f"{raw!r}: port mismatch"
+
+
+def test_recon_dirname_c10():
+    """C10 regression: a host:port target keys its own recon directory
+    (127.0.0.1:8082 -> 127.0.0.1_8082) so two ports on one host can no
+    longer overwrite each other. Portless targets keep today's name."""
+    tn = load_norm()
+    assert tn.recon_dirname("127.0.0.1:8082") == "127.0.0.1_8082"
+    assert tn.recon_dirname("localhost:3000") == "localhost_3000"
+    assert tn.recon_dirname("https://9am.io:8443/") == "9am.io_8443"
+    assert tn.recon_dirname("9am.io") == "9am.io"
+    assert tn.recon_dirname("https://9am.io/") == "9am.io"
+    assert tn.recon_dirname("10.0.0.5") == "10.0.0.5"
+    assert tn.recon_dirname("../../etc") is None
+    assert tn.recon_dirname("") is None

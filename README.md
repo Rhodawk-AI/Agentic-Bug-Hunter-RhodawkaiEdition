@@ -47,9 +47,9 @@
 
 RhodawkAI Edition fixes the deterministic plumbing *before* an LLM ever sees the data: scope enforcement, CDN classification, bounded reconFTW delegation, and canonical state fusion are all plain, auditable code — not prompt hopes. The model is only invited at the end, to rank an already-clean and already-honest attack surface, never to decide what runs.
 
-- 🔒 **Fail-Closed Scope Gate (`0` packets on OOS):** Targets outside `--scope-domain` abort before any scanner runs — the engine refuses to send a single packet to an out-of-scope host.
+- 🔒 **Fail-Closed Scope Gate:** Targets outside `--scope-domain` abort before any scanner runs — `0` packets are sent **to the blocked target**. Hosts/URLs *discovered* during enumeration are additionally filtered through the same scope rules before any probing tool reads them, and `--no-scope-check` disables scoping entirely (local demo testing only).
 - 🌐 **CDN & Origin Isolation:** Classifies live hosts into `CDN_EDGE` vs. `FIRST_PARTY_ORIGIN` via DNS CNAME/A + `httpx` tech tags, skipping `nmap` on CDN edges (`0s` / `0` packets wasted on Vercel/Cloudflare IPs).
-- ⚙️ **Bounded `reconFTW` Gap-Fillers + Honest Telemetry:** Pins reconFTW (`3925211`) and invokes targeted `-c <fn>` modules in isolated workdirs instead of the monolithic `-r` run — printing a 6-row `tool_health` table (`COMPLETED_EMPTY`, `SKIPPED_SILENT`, `FAILED`) so nothing ever fails silently.
+- ⚙️ **Bounded `reconFTW` Gap-Fillers + Honest Telemetry:** Pins reconFTW (`3925211`) and invokes targeted `-c <fn>` modules in isolated workdirs instead of the monolithic `-r` run — printing a `tool_health` row per delegated capability (7) using the adapter's status vocabulary (`COMPLETED_WITH_FINDINGS`, `COMPLETED_EMPTY`, `FAILED`, `TIMEOUT`, `SKIPPED`, `SKIPPED_SILENT`, `DEGRADED`) so nothing ever fails silently.
 - 🧩 **Canonical State, Clustering & Diffs:** Fuses ~20 loose raw outputs into `recon_truth.json` (with SimHash host clustering so agents don't burn tokens on duplicate pages) + `delta.json` run-to-run diffs.
 - 🩺 **Managed Chromium SPA Crawling & 5-Second Diagnostics:** A single managed Chromium (`bash install_tools.sh --browser`) powers `katana` SPA crawling, and `rhodawk doctor` verifies all 8 core binaries, reconFTW, Chromium, MCP imports, and live LLM connectivity in `<5s`.
 - 🧠 **Open-Weight AI Prioritization:** Generates `recon_brief.md` via **NVIDIA NIM** or local **Ollama** — zero closed-model lock-in.
@@ -109,7 +109,7 @@ bash install_tools.sh && bash install_tools.sh --browser
 # 3. Verify everything in <5 seconds
 rhodawk doctor
 
-# 4. Prove the fail-closed scope gate — an out-of-scope target aborts with 0 packets sent
+# 4. Prove the fail-closed scope gate — an out-of-scope target aborts with 0 packets sent TO that target
 rhodawk evil.example -recon --scope-domain "*.goodscope.example"
 
 # 5. Run live, CDN-aware recon
@@ -189,7 +189,7 @@ Wherever the built-in recon pipeline hits a capability it doesn't own, the routi
 | Favicon fingerprint (`CAP_FAVICON`) | `favirecon_tech` | Phase 5.5 (before ffuf) |
 
 > [!TIP]
-> **Guardrails, not vibes:** `install.sh` clones reconFTW at the pinned commit `3925211` and auto-persists `rtw_home` into `~/.bughunter/config.json` (override anytime with `RTW_HOME=...`). Each delegation runs one targeted `-c <fn>` module in an isolated workdir — never the monolithic `-r` — and every output file is scope-filtered post-call. `modules/vulns.sh` is never delegated: RhodawkAI's verifier spine stays the only thing allowed to promote a finding. Results are traced in `~/.bughunter/recon/<host>/rtw_manifest.json` (identical schema across runtimes, 7-day TTL), and the `tool_health` rows in `recon_truth.json` report every capability as `COMPLETED`, `COMPLETED_EMPTY`, `SKIPPED_SILENT`, or `FAILED`.
+> **Guardrails, not vibes:** `install.sh` clones reconFTW at the pinned commit `3925211` and auto-persists `rtw_home` into `~/.bughunter/config.json` (override anytime with `RTW_HOME=...`). Each delegation runs one targeted `-c <fn>` module in an isolated workdir — never the monolithic `-r` — and every output file is scope-filtered post-call. `modules/vulns.sh` is never delegated: RhodawkAI's verifier spine stays the only thing allowed to promote a finding. Results are traced in `~/.bughunter/recon/<host>/rtw_manifest.json` (identical schema across runtimes, 7-day TTL), and the `tool_health` rows in `recon_truth.json` report every capability with the adapter's status enum: `COMPLETED_WITH_FINDINGS`, `COMPLETED_EMPTY`, `FAILED`, `TIMEOUT`, `SKIPPED`, `SKIPPED_SILENT`, or `DEGRADED` (plus the `FUSION` row recording the canonical-fusion outcome).
 
 </details>
 
@@ -251,7 +251,7 @@ Agentic-Bug-Hunter-RhodawkaiEdition/
 ├── .github/workflows/ci.yml   # green CI gate: bash -n + pytest -q on every push/PR
 ├── install.sh                 # standalone install · pinned reconFTW clone · 'rhodawk' alias
 ├── install_tools.sh           # subfinder · httpx · nuclei · katana · ffuf · nmap · … + --browser Chromium
-├── pyproject.toml             # package metadata — agentic-bug-hunter-rhodawkai-edition 6.1.0
+├── pyproject.toml             # package metadata — agentic-bug-hunter-rhodawkai-edition 6.1.1.1
 └── requirements.txt           # requests · pytest · mcp
 ```
 

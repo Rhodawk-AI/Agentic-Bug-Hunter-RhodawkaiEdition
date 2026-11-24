@@ -15,6 +15,8 @@ checkout (no network, no real scanners needed):
 3. RTW_HOME unset → engine behaves as upstream (gap-fill skipped, no crash).
 """
 
+import argparse
+import shutil
 import json
 import os
 import subprocess
@@ -413,3 +415,414 @@ class TestShorthandAndHonestRecon:
         assert "Delta vs previous run" in out2
         # Step 1B fix 4: the 7-row recon health table prints at the end.
         assert "Capability" in out2 and "Net-New" in out2
+
+
+class TestScopedRedirectEnforcement:
+    """B2 regression: engine.py cmd_recon/cmd_hunt must set SCOPE_ENFORCED=1
+    whenever scoping is active (explicit patterns or the self-scoped local
+    path), so recon_engine.sh runs httpx WITHOUT -follow-redirects. A local
+    301 to an out-of-scope listener must receive 0 requests, the destination
+    must not appear in live/httpx_full.txt or live/urls.txt, and the
+    destination is recorded as a finding in live/redirects.txt."""
+
+    def test_cmd_recon_and_hunt_set_scope_enforced(self, monkeypatch):
+        """Unit: SCOPE_ENFORCED=1 whenever scoping is active; absent for
+        --no-scope-check. Matches hunt.py run_recon's rule."""
+        sys.path.insert(0, str(REPO_ROOT / "bughunter"))
+        import engine
+        captured = {}
+
+        def fake_run_shell(cmd, cwd=None, timeout=3600, env=None):
+            captured["env"] = dict(env or {})
+            return True, ""
+
+        monkeypatch.setattr(engine, "_run_shell", fake_run_shell)
+
+        class _FakeBrain:
+            def analyze_recon(self, *a, **k):
+                return "ok"
+
+            def interpret_scan(self, *a, **k):
+                return "ok"
+
+        monkeypatch.setattr(engine, "_get_brain", lambda: _FakeBrain())
+        ns = argparse.Namespace(target="127.0.0.1:8080", scope_domain=[],
+                                scope_exclude=[], no_scope_check=False)
+        engine.cmd_recon(ns)
+        assert captured["env"].get("SCOPE_ENFORCED") == "1"
+        assert captured["env"].get("RECON_OUT_DIR")
+        ns.no_scope_check = True
+        engine.cmd_recon(ns)
+        assert "SCOPE_ENFORCED" not in captured["env"]
+        ns.no_scope_check = False
+        ns.scope_domain = ["*.example.test"]
+        engine.cmd_recon(ns)
+        assert captured["env"].get("SCOPE_ENFORCED") == "1"
+        engine.cmd_hunt(argparse.Namespace(
+            target="127.0.0.1:8080", scope_domain=[], scope_exclude=[],
+            no_scope_check=False))
+        assert captured["env"].get("SCOPE_ENFORCED") == "1"
+
+    def test_scoped_recon_does_not_follow_redirects(self, rtw_env, tmp_path):
+        """Integration: two real localhost listeners — A (target) 301s to B
+        (out of scope). Before the fix the scoped CLI run hopped to B (>=1
+        request, destination in outputs); after the fix B sees 0 requests,
+        the destination is only recorded in live/redirects.txt."""
+        import http.server
+        import threading
+
+        counts = {"a": 0, "b": 0}
+
+        class HandlerB(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                counts["b"] += 1
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"<html><title>OOS</title></html>")
+
+            def log_message(self, *a):
+                pass
+
+        class HandlerA(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                counts["a"] += 1
+                self.send_response(301)
+                self.send_header(
+                    "Location",
+                    f"http://127.0.0.1:{srv_b.server_port}/")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv_a = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), HandlerA)
+        srv_b = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), HandlerB)
+        for srv in (srv_a, srv_b):
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        # A fetching httpx stub: without -follow-redirects a 3xx is recorded
+        # but NOT followed; with it, the Location host is fetched (counted).
+        stub_bin = rtw_env["stub_bin"]
+        httpx_fetch = stub_bin / "httpx"
+        httpx_fetch.write_text(f'''#!/usr/bin/env python3
+import sys, urllib.request, urllib.error
+args = sys.argv[1:]
+if "-version" in args:
+    print("httpx 1.3.5 projectdiscovery"); sys.exit(0)
+follow = "-follow-redirects" in args
+in_file = out_file = None
+i = 0
+while i < len(args):
+    if args[i] == "-l": in_file = args[i + 1]
+    if args[i] == "-o": out_file = args[i + 1]
+    i += 1
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+opener = urllib.request.build_opener(NoRedirect)
+lines = []
+if in_file:
+    lines = [l.strip() for l in open(in_file, encoding="utf-8") if l.strip()]
+with open(out_file, "w", encoding="utf-8") as out:
+    for line in lines:
+        url = line if "://" in line else "http://" + line
+        try:
+            r = (urllib.request.urlopen(url, timeout=5) if follow
+                 else opener.open(url, timeout=5))
+            out.write(f"{{r.url}} [{{r.status}}] [LAB] [stub] [10]\\n")
+        except urllib.error.HTTPError as e:
+            out.write(f"{{url}} [{{e.code}}] [redirect] [stub] [0]\\n")
+        except Exception:
+            pass
+''')
+        httpx_fetch.chmod(0o755)
+        # curl stub answers the scoped HEAD with the redirect Location so the
+        # destination is recorded as a finding.
+        curl_stub = stub_bin / "curl"
+        curl_stub.write_text(
+            "#!/bin/bash\n"
+            'echo "HTTP/1.1 301 Moved Permanently"\n'
+            f'echo "Location: http://127.0.0.1:{srv_b.server_port}/"\n'
+            "exit 0\n")
+        curl_stub.chmod(0o755)
+
+        target = f"127.0.0.1:{srv_a.server_port}"
+        env = os.environ.copy()
+        env.update({
+            "BUGHUNTER_HOME": str(rtw_env["home"]),
+            "BUGHUNTER_CAPABILITIES_FILE": str(rtw_env["capabilities"]),
+        })
+        proc = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "bughunter" / "engine.py"),
+             "recon", target],
+            cwd=str(REPO_ROOT), env=env, capture_output=True, text=True,
+            timeout=300)
+        out = proc.stdout + proc.stderr
+
+        try:
+            assert counts["b"] == 0, (
+                f"out-of-scope listener received {counts['b']} request(s)\n"
+                f"{out[-3000:]}")
+            recon = rtw_env["home"] / "recon" / f"127.0.0.1_{srv_a.server_port}"
+            if not recon.is_dir():  # C10 keying may vary pre/post fix
+                legacy = rtw_env["home"] / "recon" / "127.0.0.1"
+                recon = legacy if legacy.is_dir() else recon
+            dest = f"http://127.0.0.1:{srv_b.server_port}"
+            httpx_full = (recon / "live" / "httpx_full.txt")
+            urls = (recon / "live" / "urls.txt")
+            if httpx_full.exists():
+                assert dest not in httpx_full.read_text(), \
+                    "redirect destination leaked into live/httpx_full.txt"
+            if urls.exists():
+                assert dest not in urls.read_text(), \
+                    "redirect destination leaked into live/urls.txt"
+            redirects = (recon / "live" / "redirects.txt")
+            assert redirects.is_file() and dest in redirects.read_text(), \
+                "redirect destination not recorded as a finding"
+            assert "recorded, NOT probed" in redirects.read_text()
+        finally:
+            srv_a.shutdown()
+            srv_b.shutdown()
+            srv_a.server_close()
+            srv_b.server_close()
+
+
+class TestPostEnumerationScopeFilter:
+    """B3 regression: hosts/URLs discovered OUT of scope (stub subfinder /
+    katana / gau emit oos.evil.com) are filtered BEFORE any probing tool
+    reads them. Dropped lines land in scope/dropped_oos.txt, the dropped
+    count in the Summary and in recon_truth.json counts.scope_dropped. The
+    filter is a no-op with --no-scope-check and self-scopes local targets."""
+
+    @staticmethod
+    def _oos_stubbin(tmp_path):
+        stub = tmp_path / "oos-bin"
+        stub.mkdir(exist_ok=True)
+        subfinder = stub / "subfinder"
+        subfinder.write_text(
+            "#!/bin/bash\n"
+            'out=""\n'
+            'while [[ $# -gt 0 ]]; do case "$1" in -o) out="$2";; esac; shift; done\n'
+            '[[ -n "$out" ]] && printf "target.goodscope.example\\noos.evil.com\\n" > "$out"\n'
+            "exit 0\n")
+        subfinder.chmod(0o755)
+        katana = stub / "katana"
+        katana.write_text(
+            "#!/bin/bash\n"
+            'list=""; out=""\n'
+            'while [[ $# -gt 0 ]]; do case "$1" in -list) list="$2";; -o) out="$2";; esac; shift; done\n'
+            '{ while IFS= read -r u; do echo "http://$u/api"; done < "$list";\n'
+            '  echo "http://oos.evil.com/leak"; } > "$out"\n'
+            "exit 0\n")
+        katana.chmod(0o755)
+        gau = stub / "gau"
+        gau.write_text(
+            "#!/bin/bash\n"
+            'out=""\n'
+            'while [[ $# -gt 0 ]]; do case "$1" in --o) out="$2";; esac; shift; done\n'
+            'if [[ -n "$out" ]]; then echo "http://oos.evil.com/old-page" > "$out";\n'
+            'else echo "http://oos.evil.com/old-page"; fi\n'
+            "exit 0\n")
+        gau.chmod(0o755)
+        # httpx echoes every probed host, so an OOS host in its -l input
+        # would land in live/httpx_full.txt (the before-fix behavior).
+        httpx = stub / "httpx"
+        httpx.write_text(
+            "#!/bin/bash\n"
+            'if [[ "$1" == "-version" ]]; then echo "httpx 1.3.5 projectdiscovery"; exit 0; fi\n'
+            'out=""; list=""\n'
+            'while [[ $# -gt 0 ]]; do case "$1" in -o) out="$2";; -l) list="$2";; esac; shift; done\n'
+            '[[ -n "$out" && -n "$list" ]] || exit 0\n'
+            'while IFS= read -r h; do [[ -z "$h" ]] && continue;\n'
+            '  echo "$h [200] [Welcome] [nginx] [2048]"; done < "$list" > "$out"\n'
+            "exit 0\n")
+        httpx.chmod(0o755)
+        return stub
+
+    def test_oos_discoveries_filtered_before_probing(self, rtw_env, tmp_path):
+        stub = self._oos_stubbin(tmp_path)
+        for tool in ("subfinder", "katana", "gau", "httpx"):
+            shutil.copyfile(stub / tool, rtw_env["stub_bin"] / tool)
+            (rtw_env["stub_bin"] / tool).chmod(0o755)
+        proc = run_engine([TARGET, "--scope-domain", SCOPE[0]])
+        out = proc.stdout + proc.stderr
+        assert proc.returncode == 0, out[-3000:]
+        recon = rtw_env["recon_out"]
+        for rel in ("subdomains/all.txt", "urls/all.txt",
+                    "live/httpx_full.txt", "live/urls.txt"):
+            text = (recon / rel).read_text() if (recon / rel).exists() else ""
+            assert "oos.evil.com" not in text, f"OOS asset leaked into {rel}"
+        assert "target.goodscope.example" in \
+            (recon / "subdomains" / "all.txt").read_text()
+        dropped = recon / "scope" / "dropped_oos.txt"
+        assert dropped.is_file(), "dropped_oos.txt missing"
+        dropped_text = dropped.read_text()
+        assert "oos.evil.com" in dropped_text
+        truth = json.loads((recon / "recon_truth.json").read_text())
+        assert truth["counts"]["scope_dropped"] >= 3
+        assert "Scope-filtered (dropped OOS)" in out
+        # in-scope URL survived the URL-side filter
+        assert "http://target.goodscope.example/api" in \
+            (recon / "urls" / "all.txt").read_text()
+
+    def test_no_scope_check_filter_is_noop(self, rtw_env, tmp_path):
+        stub = self._oos_stubbin(tmp_path)
+        for tool in ("subfinder", "katana", "gau", "httpx"):
+            shutil.copyfile(stub / tool, rtw_env["stub_bin"] / tool)
+            (rtw_env["stub_bin"] / tool).chmod(0o755)
+        proc = run_engine([TARGET, "--no-scope-check"])
+        out = proc.stdout + proc.stderr
+        assert proc.returncode == 0, out[-3000:]
+        all_txt = (rtw_env["recon_out"] / "subdomains" / "all.txt").read_text()
+        assert "oos.evil.com" in all_txt, \
+            "--no-scope-check must leave the filter as a no-op"
+        assert not (rtw_env["recon_out"] / "scope" / "dropped_oos.txt").exists()
+
+    def test_local_target_self_scoping_kept(self, rtw_env, tmp_path):
+        """Local target without patterns: the filter self-scopes to the
+        target itself and keeps the target's host:port probe entry."""
+        proc = run_engine(["127.0.0.1:8080", "--no-scope-check"])
+        assert proc.returncode == 0, (proc.stdout + proc.stderr)[-2000:]
+
+
+class TestRunIsolation:
+    """B5 regression: a re-run must not mix stale artifacts into the new
+    Summary. After a run whose httpx phase produced nothing, the Summary must
+    show Live hosts: 0 (run 1's live/urls.txt must not leak)."""
+
+    def test_second_run_does_not_leak_stale_summary(self, rtw_env):
+        proc = run_engine([TARGET, "--scope-domain", SCOPE[0]])
+        out = proc.stdout + proc.stderr
+        assert proc.returncode == 0, out[-3000:]
+        assert "Live hosts:        2" in out
+        recon = rtw_env["recon_out"]
+
+        # simulate httpx disappearing between runs (bin_nohx scenario)
+        (rtw_env["stub_bin"] / "httpx").unlink()
+        proc2 = run_engine([TARGET, "--scope-domain", SCOPE[0]])
+        out2 = proc2.stdout + proc2.stderr
+        assert proc2.returncode == 0, out2[-3000:]
+        assert "Live hosts:        0" in out2, \
+            f"stale run-1 artifacts leaked into the Summary\n{out2[-2500:]}"
+        truth = json.loads((recon / "recon_truth.json").read_text())
+        assert truth["counts"]["live_hosts"] == 0
+        # the previous truth is kept as the delta baseline
+        assert (recon / ".prev_run" / "recon_truth.json").is_file()
+        delta = json.loads((recon / "delta.json").read_text())
+        assert delta["has_previous_run"] is True
+
+    def test_second_run_rebuilds_fresh_artifacts(self, rtw_env):
+        assert run_engine([TARGET, "--scope-domain", SCOPE[0]]).returncode == 0
+        recon = rtw_env["recon_out"]
+        (recon / "live" / "httpx_full.txt").write_text("STALE\n")
+        (recon / "urls" / "all.txt").write_text("STALE\n")
+        assert run_engine([TARGET, "--scope-domain", SCOPE[0]]).returncode == 0
+        assert "STALE" not in (recon / "live" / "httpx_full.txt").read_text()
+        assert "STALE" not in (recon / "urls" / "all.txt").read_text()
+
+
+class TestRunIncompleteMarker:
+    """B6 regression: an unclean previous run is recorded in the next truth
+    (previous_run_incomplete) and warned about."""
+
+    def test_marker_recorded_in_next_truth(self, rtw_env):
+        proc = run_engine([TARGET, "--scope-domain", SCOPE[0]])
+        out = proc.stdout + proc.stderr
+        assert proc.returncode == 0, out[-3000:]
+        truth = json.loads(
+            (rtw_env["recon_out"] / "recon_truth.json").read_text())
+        assert truth.get("previous_run_incomplete") is False
+        # simulate a killed run: the marker file was left behind
+        (rtw_env["recon_out"] / ".run_incomplete").write_text("killed\n")
+        proc2 = run_engine([TARGET, "--scope-domain", SCOPE[0]])
+        out2 = proc2.stdout + proc2.stderr
+        assert proc2.returncode == 0, out2[-3000:]
+        assert "did not complete" in out2
+        truth2 = json.loads(
+            (rtw_env["recon_out"] / "recon_truth.json").read_text())
+        assert truth2.get("previous_run_incomplete") is True
+        # a clean run clears the marker and the flag flips back
+        proc3 = run_engine([TARGET, "--scope-domain", SCOPE[0]])
+        assert proc3.returncode == 0
+        truth3 = json.loads(
+            (rtw_env["recon_out"] / "recon_truth.json").read_text())
+        assert truth3.get("previous_run_incomplete") is False
+        assert not (rtw_env["recon_out"] / ".run_incomplete").exists()
+
+
+class TestHostPortReconDirs:
+    """C10 regression: 127.0.0.1:8082 and 127.0.0.1:8083 key separate recon
+    directories; the first run's data survives the second run."""
+
+    def test_two_ports_two_dirs(self, rtw_env):
+        import http.server
+        import threading
+
+        def handler(port_label):
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    self.wfile.write(
+                        f"<html><title>LAB {port_label}</title></html>".encode())
+
+                def log_message(self, *a):
+                    pass
+            return H
+
+        srv1 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler("P1"))
+        srv2 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler("P2"))
+        for srv in (srv1, srv2):
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            env = os.environ.copy()
+            env.update({
+                "BUGHUNTER_HOME": str(rtw_env["home"]),
+                "BUGHUNTER_CAPABILITIES_FILE": str(rtw_env["capabilities"]),
+            })
+            common = [sys.executable,
+                      str(REPO_ROOT / "bughunter" / "engine.py"), "recon"]
+            p1 = subprocess.run(common + [f"127.0.0.1:{srv1.server_port}"],
+                                cwd=str(REPO_ROOT), env=env,
+                                capture_output=True, text=True, timeout=300)
+            p2 = subprocess.run(common + [f"127.0.0.1:{srv2.server_port}"],
+                                cwd=str(REPO_ROOT), env=env,
+                                capture_output=True, text=True, timeout=300)
+            assert p1.returncode == 0, (p1.stdout + p1.stderr)[-2000:]
+            assert p2.returncode == 0, (p2.stdout + p2.stderr)[-2000:]
+            base = rtw_env["home"] / "recon"
+            d1 = base / f"127.0.0.1_{srv1.server_port}"
+            d2 = base / f"127.0.0.1_{srv2.server_port}"
+            assert d1.is_dir() and d2.is_dir(), \
+                f"host:port dirs missing: {sorted(p.name for p in base.iterdir())}"
+            # the data-home mirror (~/.bughunter/recon/<host>/recon_truth.json)
+            # stays host-keyed by design — assert the OUTPUT pipeline itself
+            # never writes artifacts into a bare-host dir
+            assert not (base / "127.0.0.1" / "live").is_dir(), \
+                "legacy bare-host OUTPUT dir still written for host:port targets"
+            full1 = (d1 / "live" / "httpx_full.txt").read_text()
+            full2 = (d2 / "live" / "httpx_full.txt").read_text()
+            assert f"127.0.0.1:{srv1.server_port}" in full1, full1
+            assert f"127.0.0.1:{srv2.server_port}" in full2, full2
+            assert f"127.0.0.1:{srv2.server_port}" not in full1, \
+                "run 2 overwrote run 1's directory contents"
+        finally:
+            srv1.shutdown(); srv2.shutdown()
+            srv1.server_close(); srv2.server_close()
+
+    def test_hunt_resolve_recon_dir_port_aware(self, monkeypatch, tmp_path):
+        sys.path.insert(0, str(REPO_ROOT / "bughunter"))
+        sys.path.insert(0, str(REPO_ROOT / "bughunter" / "tools"))
+        monkeypatch.setenv("BUGHUNTER_HOME", str(tmp_path))
+        import importlib
+        import tools.hunt as hunt
+        importlib.reload(hunt)
+        assert hunt._resolve_recon_dir(
+            "127.0.0.1:8080").endswith(os.path.join("recon", "127.0.0.1_8080"))
+        assert hunt._resolve_recon_dir(
+            "app.example.test").endswith(
+                os.path.join("recon", "app.example.test"))
