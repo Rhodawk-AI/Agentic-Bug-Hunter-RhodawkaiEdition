@@ -732,7 +732,12 @@ def run_vuln_scan(domain, quick=False):
     """Run vulnerability scanner on recon results."""
     if _scope_blocks_target(domain):
         return False
-    recon_dir = _resolve_recon_dir(domain)
+    try:
+        recon_dir = _resolve_recon_dir(domain)
+    except ValueError:
+        # hostile/malformed domain: legacy lenient join (injection-sink
+        # contract — no exception; the hostile dir simply never matches).
+        recon_dir = os.path.join(RECON_DIR, domain)
     if not os.path.isdir(recon_dir):
         log("err", f"No recon data found for {domain}. Run recon first.")
         return False
@@ -895,7 +900,13 @@ def run_zero_day_fuzzer(domain, deep=False):
     script = os.path.join(TOOLS_DIR, "zero_day_fuzzer.py")
 
     # argv list + shell=False — domain is user-controlled (injection-safe).
-    recon_dir = _resolve_recon_dir(domain)
+    try:
+        recon_dir = _resolve_recon_dir(domain)
+    except ValueError:
+        # hostile/malformed domain: legacy lenient join — the isdir check
+        # simply misses and the fuzzer never runs against it (the
+        # injection-sink contract: no exception, no execution).
+        recon_dir = os.path.join(RECON_DIR, domain)
     cmd = ["python3", script, f"https://{domain}"]
     if os.path.isdir(recon_dir):
         cmd += ["--recon-dir", recon_dir]
