@@ -1145,11 +1145,20 @@ fi
 echo ""
 log_info "Canonical Fusion (recon_truth.json)"
 if command -v python3 &>/dev/null && [ -f "$BASE_DIR/tools/recon_fusion.py" ]; then
-    python3 "$BASE_DIR/tools/recon_fusion.py" fuse --recon-dir "$RECON_DIR" --target "$TARGET" \
-        ${RTW_SCOPE_ARGS[@]+"${RTW_SCOPE_ARGS[@]}"} \
-        || log_warn "recon fusion failed (non-fatal — raw artifacts remain the fallback)"
+    if python3 "$BASE_DIR/tools/recon_fusion.py" fuse --recon-dir "$RECON_DIR" --target "$TARGET" \
+        ${RTW_SCOPE_ARGS[@]+"${RTW_SCOPE_ARGS[@]}"} ; then
+        :
+    else
+        _fuse_rc=$?
+        # B1: a failed fusion is never swallowed silently — visible warning
+        # plus a FAILED FUSION row in rtw_manifest.json (surfaces in
+        # recon_truth.json tool_health and the health-table).
+        log_err "CANONICAL FUSION FAILED (exit $_fuse_rc) — recon_truth.json/delta.json were NOT regenerated this run; raw artifacts remain the fallback"
+        python3 "$BASE_DIR/tools/recon_fusion.py" mark-failed --target "$TARGET" \
+            --reason "fuse failed (exit $_fuse_rc) in recon_engine.sh" >/dev/null 2>&1 || true
+    fi
 else
-    log_warn "python3 / recon_fusion.py unavailable — skipping canonical fusion"
+    log_err "python3 / recon_fusion.py unavailable — canonical fusion SKIPPED (no recon_truth.json this run)"
 fi
 
 # ============================================================

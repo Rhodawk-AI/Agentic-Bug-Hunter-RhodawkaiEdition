@@ -409,3 +409,47 @@ class TestClassifyCommand:
         assert rc == 0
         assert (recon_dir / "hosts" / "host_classes.txt").is_file()
         assert rf.main(["delta-line", "--recon-dir", str(recon_dir)]) == 0
+
+
+class TestFusionScopeOptOutAndHealth:
+    """B1 regression: `--no-scope-check` must not kill canonical fusion, the
+    truth must record scope_enforced, and fuse failures must never be
+    swallowed silently (tool_health FUSION=FAILED)."""
+
+    def test_fuse_cli_accepts_no_scope_check_and_records_false(
+            self, recon_dir, isolated_home):
+        rc = rf.main(["fuse", "--recon-dir", str(recon_dir),
+                      "--target", "t.example.com", "--no-scope-check"])
+        assert rc == 0
+        truth = json.loads((recon_dir / "recon_truth.json").read_text())
+        assert truth["scope_enforced"] is False
+        assert (recon_dir / "delta.json").is_file()
+
+    def test_fuse_records_scope_enforced_true_by_default(
+            self, recon_dir, isolated_home):
+        assert rf.main(["fuse", "--recon-dir", str(recon_dir),
+                        "--target", "t.example.com"]) == 0
+        truth = json.loads((recon_dir / "recon_truth.json").read_text())
+        assert truth["scope_enforced"] is True
+
+    def test_mark_failed_records_fusion_failed_in_tool_health(
+            self, recon_dir, isolated_home):
+        rc = rf.main(["mark-failed", "--target", "t.example.com",
+                      "--reason", "fuse exploded"])
+        assert rc == 0
+        truth = rf.build_truth(recon_dir, "t.example.com")
+        fusion = [h for h in truth["tool_health"]
+                  if h["capability_id"] == "FUSION"]
+        assert fusion and fusion[0]["status"] == "FAILED"
+        assert "fuse exploded" in fusion[0]["reason"]
+
+    def test_successful_fuse_clears_stale_fusion_failed_entry(
+            self, recon_dir, isolated_home):
+        rf.main(["mark-failed", "--target", "t.example.com", "--reason", "x"])
+        rf.main(["fuse", "--recon-dir", str(recon_dir),
+                 "--target", "t.example.com"])
+        manifest = json.loads(
+            (isolated_home / "recon" / "t.example.com" / "rtw_manifest.json")
+            .read_text())
+        assert all(e.get("capability_id") != "FUSION"
+                   for e in manifest.get("entries", []))

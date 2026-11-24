@@ -60,6 +60,17 @@ CLASS_CDN_EDGE = "CDN_EDGE"
 CLASS_SAAS = "THIRD_PARTY_SAAS"
 CLASS_ORIGIN = "FIRST_PARTY_ORIGIN"
 
+# tool_health pseudo-capability recording the canonical-fusion step itself.
+# A failed fuse used to be swallowed as a single non-fatal log line; it is now
+# persisted as a FAILED row in rtw_manifest.json so recon_truth.json's
+# tool_health (and the adapter health-table) surface it until fusion heals.
+FUSION_CAPABILITY_ID = "FUSION"
+
+# Truth-level status (B7): "OK" or "DEGRADED" when a required input is
+# unparseable. See input_integrity().
+STATUS_OK = "OK"
+STATUS_DEGRADED = "DEGRADED"
+
 # Same status vocabulary as rtw_adapter.py's manifest entries (fusion is
 # stdlib-only and must not import the adapter).
 RESULT_FAILED = "FAILED"
@@ -341,6 +352,48 @@ def data_home() -> Path:
 def _host_key(target: str) -> str:
     s = _strip_host(target)
     return s or "unknown"
+
+
+def record_fusion_status(target: str, status: str, reason: str = "") -> None:
+    """Write (or clear) the FUSION row of rtw_manifest.json — the same manifest
+    the rtw_adapter uses, so tool_health in recon_truth.json and the
+    health-table both show the canonical-fusion outcome. status FAILED upserts
+    the row; any other status clears it (a successful fuse must not leave a
+    stale FAILED row behind). Never raises."""
+    manifest_path = data_home() / "recon" / _host_key(target) / "rtw_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            manifest = {}
+    except (OSError, ValueError):
+        manifest = {}
+    entries = manifest.setdefault("entries", [])
+    if status == RESULT_FAILED:
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        entries[:] = [e for e in entries
+                      if e.get("capability_id") != FUSION_CAPABILITY_ID]
+        entries.append({
+            "capability_id": FUSION_CAPABILITY_ID,
+            "rtw_function": "recon_fusion.fuse",
+            "target": _host_key(target),
+            "input_hash": "",
+            "status": RESULT_FAILED,
+            "started": now, "finished": now,
+            "reason": reason,
+        })
+    else:
+        kept = [e for e in entries
+                if e.get("capability_id") != FUSION_CAPABILITY_ID]
+        if len(kept) == len(entries):
+            return
+        manifest["entries"] = kept
+    try:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8")
+    except OSError:
+        pass
 
 
 # ── Fusion ────────────────────────────────────────────────────────────────────
@@ -650,12 +703,20 @@ def compute_delta(previous: dict, current: dict) -> dict:
 
 def fuse(recon_dir: Path, target: str,
          scope_domains: Optional[List[str]] = None,
-         scope_excluded: Optional[List[str]] = None) -> Tuple[dict, Optional[dict]]:
+         scope_excluded: Optional[List[str]] = None,
+         scope_enforced: bool = True) -> Tuple[dict, Optional[dict]]:
     """Build the new truth, diff against the previous run, archive the old
-    truth, write recon_truth.json + delta.json + the mirror copy."""
+    truth, write recon_truth.json + delta.json + the mirror copy.
+
+    scope_enforced=False records an explicit --no-scope-check run so the
+    truth document states its own enforcement status (B1)."""
     recon_dir = Path(recon_dir)
     truth_path = recon_dir / "recon_truth.json"
     delta_path = recon_dir / "delta.json"
+
+    # A successful fuse clears any stale FUSION=FAILED row BEFORE the truth is
+    # built, so recon_truth.json reflects this (healthy) fusion outcome.
+    record_fusion_status(target, "COMPLETED")
 
     previous: Optional[dict] = None
     try:
@@ -673,6 +734,7 @@ def fuse(recon_dir: Path, target: str,
         previous = None
 
     truth = build_truth(recon_dir, target, scope_domains, scope_excluded)
+    truth["scope_enforced"] = bool(scope_enforced)
     truth_path.write_text(json.dumps(truth, indent=2, sort_keys=True) + "\n",
                           encoding="utf-8")
 
@@ -718,7 +780,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_fuse.add_argument("--target", required=True)
     p_fuse.add_argument("--scope-domain", action="append", default=[])
     p_fuse.add_argument("--scope-exclude", action="append", default=[])
+    p_fuse.add_argument("--no-scope-check", action="store_true",
+                        help="record scope_enforced=false (recon_engine.sh forwards "
+                             "this when the run used the demo opt-out; fusion still runs)")
     p_fuse.add_argument("--quiet", action="store_true")
+
+    p_mark = sub.add_parser(
+        "mark-failed",
+        help="record a FAILED FUSION row in rtw_manifest.json (surfaces in "
+             "tool_health + health-table); used by recon_engine.sh when fuse fails")
+    p_mark.add_argument("--target", required=True)
+    p_mark.add_argument("--reason", required=True)
 
     p_classify = sub.add_parser("classify",
                                 help="write hosts/host_classes.txt + origin_targets.txt "
@@ -738,6 +810,12 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"{counts['CDN_EDGE']} CDN edge(s), {counts['THIRD_PARTY_SAAS']} third-party SaaS")
         return 0
 
+    if args.cmd == "mark-failed":
+        record_fusion_status(args.target, RESULT_FAILED, args.reason)
+        print(f"[!] FUSION marked FAILED in rtw_manifest.json: {args.reason}",
+              file=sys.stderr)
+        return 0
+
     if args.cmd == "delta-line":
         try:
             delta = json.loads(
@@ -750,7 +828,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     truth, delta = fuse(Path(args.recon_dir), args.target,
                         scope_domains=args.scope_domain,
-                        scope_excluded=args.scope_exclude)
+                        scope_excluded=args.scope_exclude,
+                        scope_enforced=not args.no_scope_check)
     if not args.quiet:
         c = truth["counts"]
         print(f"[+] recon_truth.json: {Path(args.recon_dir) / 'recon_truth.json'} "
