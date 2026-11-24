@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -583,23 +584,65 @@ def build_truth(recon_dir: Path, target: str,
     ports = parse_nmap_greppable(
         _read_lines(recon_dir / "ports" / "nmap_greppable.txt"))
     if not ports:
-        # Fallback: open_ports.txt (`80/open` lines) has no host column.
+        # Fallback: open_ports.txt (`80/open` lines) has no host column —
+        # inherently unjoinable, so these rows can only ever be unattributed.
         ports = [{"host": "", "port": int(p.split("/")[0]), "protocol": "tcp",
                   "service": ""}
                  for p in sorted(set(_read_lines(recon_dir / "ports" / "open_ports.txt")))
                  if p.split("/")[0].isdigit()]
+
+    # B4: attribute open ports ONLY to hosts they can be joined to. The nmap
+    # row's own hostname is kept; an IP is joined through hosts/resolution.txt
+    # ONLY when exactly ONE host resolves to it — a shared IP (loopback, NAT,
+    # CDN edge) is ambiguous and must never silently borrow port rows (the E9
+    # defect put port 80 on oos.example.test via the shared lab loopback).
+    # Everything unjoinable is reported under truth['unattributed_ports'].
+    ip_to_hosts: Dict[str, Set[str]] = {}
+    for _h, _res in resolution.items():
+        _ip = (_res or {}).get("ip", "")
+        if _ip:
+            ip_to_hosts.setdefault(_ip, set()).add(_h)
+
+    def _is_ip_literal(text: str) -> bool:
+        try:
+            ipaddress.ip_address(text)
+            return True
+        except ValueError:
+            return False
+
     seen_ports: Set[Tuple] = set()
     port_rows: List[dict] = []
+    unattributed_rows: List[dict] = []
     for p in ports:
-        key = (p["host"], p["port"])
+        key = (p.get("host") or "", p["port"])
         if key in seen_ports:
             continue
         seen_ports.add(key)
-        port_rows.append({"host": p["host"], "port": p["port"],
-                          "protocol": p.get("protocol", "tcp"),
-                          "service": p.get("service", ""),
-                          "discovered_by": ["ports/nmap_greppable.txt"]})
+        nmap_host = p.get("host") or ""
+        host_label = ""
+        if nmap_host and not _is_ip_literal(nmap_host):
+            host_label = nmap_host
+        elif nmap_host:
+            joinable = sorted(ip_to_hosts.get(nmap_host, set()))
+            if len(joinable) == 1:
+                host_label = joinable[0]
+        if host_label:
+            port_rows.append({"host": host_label, "port": p["port"],
+                              "protocol": p.get("protocol", "tcp"),
+                              "service": p.get("service", ""),
+                              "nmap_host": nmap_host,
+                              "discovered_by": ["ports/nmap_greppable.txt"]})
+        else:
+            unattributed_rows.append({
+                "port": p["port"],
+                "protocol": p.get("protocol", "tcp"),
+                "service": p.get("service", ""),
+                "source_host": nmap_host,
+                "discovered_by": ["ports/open_ports.txt"] if not nmap_host
+                                 else ["ports/nmap_greppable.txt"],
+            })
     port_rows.sort(key=lambda r: (r["host"], r["port"]))
+    unattributed_rows.sort(key=lambda r: (r["source_host"], r["port"]))
 
     # Tool health — the honest per-capability accounting from rtw_manifest.json.
     tool_health: List[dict] = []
@@ -663,6 +706,7 @@ def build_truth(recon_dir: Path, target: str,
         "urls": url_rows,
         "js_endpoints": js_rows,
         "ports": port_rows,
+        "unattributed_ports": unattributed_rows,
     }
 
 
