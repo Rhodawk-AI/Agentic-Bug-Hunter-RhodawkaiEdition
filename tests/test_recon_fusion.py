@@ -546,3 +546,53 @@ class TestPortAttribution:
         assert all(p["host"] != "oos.example.test"
                    for p in delta2["new_open_ports"])
         assert delta2["new_open_ports"] == []
+
+
+class TestInputIntegrity:
+    """B7 regression: recon_truth.json carries an input_integrity block (per
+    input file: ok / empty / missing / unparseable); any unparseable REQUIRED
+    input sets truth status DEGRADED with a visible warning; the exit code is
+    unchanged."""
+
+    def test_binary_garbage_degrades_status(self, recon_dir, isolated_home,
+                                            capsys):
+        (recon_dir / "live" / "httpx_full.txt").write_bytes(
+            b"\x00\x01\xff\xfe binary garbage \x00")
+        rc = rf.main(["fuse", "--recon-dir", str(recon_dir),
+                      "--target", "t.example.com"])
+        assert rc == 0  # exit code unchanged
+        truth = json.loads((recon_dir / "recon_truth.json").read_text())
+        assert truth["input_integrity"]["live/httpx_full.txt"] == "unparseable"
+        assert truth["status"] == rf.STATUS_DEGRADED
+        assert "DEGRADED" in capsys.readouterr().err
+
+    def test_nul_bytes_in_subdomain_list_unparseable(self, recon_dir,
+                                                     isolated_home):
+        (recon_dir / "subdomains" / "all.txt").write_bytes(
+            b"app\x00.lab.test\ngarbage line no tld\n")
+        rf.main(["fuse", "--recon-dir", str(recon_dir),
+                 "--target", "t.example.com"])
+        truth = json.loads((recon_dir / "recon_truth.json").read_text())
+        assert truth["input_integrity"]["subdomains/all.txt"] == "unparseable"
+        assert truth["status"] == rf.STATUS_DEGRADED
+
+    def test_empty_and_missing_inputs_are_not_degraded(self, recon_dir,
+                                                       isolated_home):
+        (recon_dir / "urls" / "all.txt").write_text("")
+        (recon_dir / "ports" / "nmap_greppable.txt").unlink()
+        rf.main(["fuse", "--recon-dir", str(recon_dir),
+                 "--target", "t.example.com"])
+        truth = json.loads((recon_dir / "recon_truth.json").read_text())
+        assert truth["input_integrity"]["urls/all.txt"] == "empty"
+        assert truth["input_integrity"]["ports/nmap_greppable.txt"] == "missing"
+        assert truth["status"] == rf.STATUS_OK
+
+    def test_clean_inputs_report_ok(self, recon_dir, isolated_home):
+        rf.main(["fuse", "--recon-dir", str(recon_dir),
+                 "--target", "t.example.com"])
+        truth = json.loads((recon_dir / "recon_truth.json").read_text())
+        assert truth["status"] == rf.STATUS_OK
+        assert set(truth["input_integrity"].values()) <= {
+            "ok", "empty", "missing"}
+        assert all(v != "unparseable"
+                   for v in truth["input_integrity"].values())

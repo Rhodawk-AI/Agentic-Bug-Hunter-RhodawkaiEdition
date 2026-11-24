@@ -72,6 +72,19 @@ FUSION_CAPABILITY_ID = "FUSION"
 STATUS_OK = "OK"
 STATUS_DEGRADED = "DEGRADED"
 
+# Recon-dir inputs tracked by the integrity block (B7). A REQUIRED input that
+# is present but unparseable (binary garbage / NUL bytes / undecodable)
+# degrades the whole truth document — downstream consumers must not treat the
+# fused counts as reliable.
+_INTEGRITY_INPUTS = (
+    "subdomains/all.txt", "live/httpx_full.txt", "live/urls.txt",
+    "urls/all.txt", "ports/nmap_greppable.txt", "js/endpoints.txt",
+)
+_REQUIRED_INPUTS = (
+    "subdomains/all.txt", "live/httpx_full.txt", "urls/all.txt",
+    "ports/nmap_greppable.txt",
+)
+
 # Same status vocabulary as rtw_adapter.py's manifest entries (fusion is
 # stdlib-only and must not import the adapter).
 RESULT_FAILED = "FAILED"
@@ -348,6 +361,33 @@ def data_home() -> Path:
     if env:
         return Path(env).expanduser()
     return Path.home() / ".bughunter"
+
+
+def input_integrity(recon_dir: Path) -> Dict[str, str]:
+    """Per-input-file integrity for the fusion pass (B7): "ok" / "empty" /
+    "missing" / "unparseable". Unparseable = present with content that is not
+    valid UTF-8 text or contains NUL bytes (binary garbage, truncation,
+    encoding tricks). Never raises."""
+    out: Dict[str, str] = {}
+    for rel in _INTEGRITY_INPUTS:
+        try:
+            raw = (recon_dir / rel).read_bytes()
+        except OSError:
+            out[rel] = "missing"
+            continue
+        if not raw.strip():
+            out[rel] = "empty"
+            continue
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            out[rel] = "unparseable"
+            continue
+        if b"\x00" in raw:
+            out[rel] = "unparseable"
+            continue
+        out[rel] = "ok"
+    return out
 
 
 def _host_key(target: str) -> str:
@@ -681,6 +721,10 @@ def build_truth(recon_dir: Path, target: str,
     # B3: every line the post-enumeration scope filter dropped is quarantined
     # in scope/dropped_oos.txt ("<relpath>\t<line>"); surface the count.
     scope_dropped = len(_read_lines(recon_dir / "scope" / "dropped_oos.txt"))
+    # B7: per-input integrity; an unparseable REQUIRED input degrades the truth.
+    integrity = input_integrity(recon_dir)
+    status = STATUS_DEGRADED if any(integrity.get(rel) == "unparseable"
+                                    for rel in _REQUIRED_INPUTS) else STATUS_OK
     counts = {
         "subdomains": len(subdomains),
         "live_hosts": len(hosts),
@@ -699,6 +743,8 @@ def build_truth(recon_dir: Path, target: str,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "scope_patterns": {"domains": list(scope_domains or []),
                            "excluded": list(scope_excluded or [])},
+        "status": status,
+        "input_integrity": integrity,
         "counts": counts,
         "tool_health": tool_health,
         "subdomains": subdomains,
@@ -808,6 +854,12 @@ def fuse(recon_dir: Path, target: str,
     truth = build_truth(recon_dir, target, scope_domains, scope_excluded)
     truth["scope_enforced"] = bool(scope_enforced)
     truth["previous_run_incomplete"] = bool(previous_run_incomplete)
+    if truth.get("status") == STATUS_DEGRADED:
+        bad = [rel for rel, state in truth["input_integrity"].items()
+               if state == "unparseable"]
+        print(f"[!] recon_truth.json status DEGRADED — unparseable required "
+              f"input(s): {', '.join(bad)} (see input_integrity)",
+              file=sys.stderr)
     truth_path.write_text(json.dumps(truth, indent=2, sort_keys=True) + "\n",
                           encoding="utf-8")
 
