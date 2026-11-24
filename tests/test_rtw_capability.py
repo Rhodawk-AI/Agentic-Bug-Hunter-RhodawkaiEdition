@@ -746,3 +746,80 @@ class TestManifestShape:
         assert adp.host_key("https://Sub.Example.com:8443/path?q=1") == "sub.example.com"
         assert adp.host_key("10.0.0.5") == "10.0.0.5"
         assert adp.host_key("EXAMPLE.com.") == "example.com"
+
+
+class TestRuntimePinVerification:
+    """The adapter must re-verify the reconFTW commit at RUN TIME — the
+    registry and doctor only check the pin at install/doctor time. On a
+    HEAD != pin mismatch the delegation returns SKIPPED ('pin mismatch')
+    and the manifest records it so tool_health surfaces the refusal."""
+
+    def _init_rtw_git_repo(self, repo) -> str:
+        import subprocess as sp
+        sp.run(["git", "init", "-q", str(repo)], check=True)
+        sp.run(["git", "-C", str(repo), "-c", "user.email=t@example.test",
+                "-c", "user.name=t", "add", "-A"], check=True)
+        sp.run(["git", "-C", str(repo), "-c", "user.email=t@example.test",
+                "-c", "user.name=t", "commit", "-q", "-m", "stub rtw"],
+               check=True)
+        head = sp.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                      capture_output=True, text=True, check=True).stdout.strip()
+        return head
+
+    def test_pin_mismatch_skips_without_subprocess(self, rtw_repo,
+                                                   full_state,
+                                                   tmp_path):
+        head = self._init_rtw_git_repo(rtw_repo)
+        recon_dir = tmp_path / "recon-out"
+        recon_dir.mkdir()
+        marker = tmp_path / "stub_marker"
+        monkey_ran = False
+        saved = adp.RTW_COMMIT_PIN
+        try:
+            adp.RTW_COMMIT_PIN = "0" * 40  # != actual HEAD
+            result = adp.run_capability(
+                "CAP_DNS_PERMUT", TARGET, recon_dir=recon_dir,
+                allow_unscoped=True)
+            monkey_ran = True
+        finally:
+            adp.RTW_COMMIT_PIN = saved
+        assert monkey_ran
+        assert result["status"] == "SKIPPED"
+        assert "pin mismatch" in result["reason"]
+        assert head in result["reason"]
+        # no reconftw subprocess ran (no finding published)
+        assert not (recon_dir / "rtw" / "sub_permut").exists() or not any(
+            (recon_dir / "rtw" / "sub_permut").iterdir())
+        # the refusal is recorded on the manifest for tool_health
+        manifest = json.loads((tmp_path / "bughunter-home" / "recon" /
+                               "target.goodscope.example" /
+                               "rtw_manifest.json").read_text())
+        entries = [e for e in manifest["entries"]
+                   if e["capability_id"] == "CAP_DNS_PERMUT"]
+        assert entries and entries[-1]["status"] == "SKIPPED"
+        assert "pin mismatch" in entries[-1]["reason"]
+
+    def test_matching_pin_runs(self, rtw_repo, full_state,
+                               tmp_path, monkeypatch):
+        head = self._init_rtw_git_repo(rtw_repo)
+        monkeypatch.setattr(adp, "RTW_COMMIT_PIN", head)
+        recon_dir = tmp_path / "recon-out"
+        recon_dir.mkdir()
+        result = adp.run_capability(
+            "CAP_DNS_PERMUT", TARGET, recon_dir=recon_dir,
+            allow_unscoped=True)
+        assert result["status"] in ("COMPLETED_WITH_FINDINGS",
+                                    "COMPLETED_EMPTY"), result["reason"]
+
+    def test_non_git_checkout_is_not_a_mismatch(self, rtw_repo,
+                                                full_state,
+                                                tmp_path):
+        # the DD lab stub checkout has no .git — unknown commit must NOT
+        # block the delegation (only a real mismatch does)
+        recon_dir = tmp_path / "recon-out"
+        recon_dir.mkdir()
+        result = adp.run_capability(
+            "CAP_DNS_PERMUT", TARGET, recon_dir=recon_dir,
+            allow_unscoped=True)
+        assert result["status"] in ("COMPLETED_WITH_FINDINGS",
+                                    "COMPLETED_EMPTY"), result["reason"]
