@@ -424,6 +424,20 @@ if ! "$HTTPX_BIN" -version 2>&1 | grep -qi "projectdiscovery"; then
 fi
 export HTTPX_BIN
 
+# ── B5: run isolation — archive the previous run, wipe stale artifacts ──────
+# A re-run in the same recon dir used to mix old artifacts into the new
+# Summary (a dead httpx still reported run 1's live hosts). Archive the
+# previous truth (the delta baseline) under .prev_run/ and clear everything
+# else, so every Summary value counts the CURRENT run only. The previous
+# truth stays available to recon_fusion.py via .prev_run/recon_truth.json.
+if [ -d "$RECON_DIR" ] && [ -n "$(ls -A "$RECON_DIR" 2>/dev/null)" ]; then
+    mkdir -p "$RECON_DIR/.prev_run"
+    [ -f "$RECON_DIR/recon_truth.json" ] && \
+        mv -f "$RECON_DIR/recon_truth.json" "$RECON_DIR/.prev_run/recon_truth.json"
+    find "$RECON_DIR" -mindepth 1 -maxdepth 1 -not -name '.prev_run' \
+        -exec rm -rf {} + 2>/dev/null || true
+fi
+
 mkdir -p "$RECON_DIR"/{subdomains,live,ports,urls,js,dirs,params}
 
 # Safety net: merge partial subdomain results on early exit (watchdog kill, etc.)
@@ -1296,12 +1310,10 @@ echo "  Completed: $(date)"
 echo "============================================="
 echo ""
 echo "  Subdomains:        $(wc -l < "$RECON_DIR/subdomains/all.txt" 2>/dev/null || echo 0)"
-[ -f "$RECON_DIR/live/urls.txt" ] && \
 echo "  Live hosts:        $(wc -l < "$RECON_DIR/live/urls.txt" 2>/dev/null || echo 0)"
+echo "  URLs collected:    $(wc -l < "$RECON_DIR/urls/all.txt" 2>/dev/null || echo 0)"
 [ -f "$RECON_DIR/ports/open_ports.txt" ] && \
 echo "  Open ports:        $(wc -l < "$RECON_DIR/ports/open_ports.txt" 2>/dev/null || echo 0)"
-[ -f "$RECON_DIR/urls/all.txt" ] && \
-echo "  URLs collected:    $(wc -l < "$RECON_DIR/urls/all.txt" 2>/dev/null || echo 0)"
 [ -f "$RECON_DIR/urls/with_params.txt" ] && \
 echo "  Parameterized:     $(wc -l < "$RECON_DIR/urls/with_params.txt" 2>/dev/null || echo 0)"
 [ -f "$RECON_DIR/urls/api_endpoints.txt" ] && \

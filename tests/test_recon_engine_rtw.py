@@ -686,3 +686,68 @@ class TestPostEnumerationScopeFilter:
         target itself and keeps the target's host:port probe entry."""
         proc = run_engine(["127.0.0.1:8080", "--no-scope-check"])
         assert proc.returncode == 0, (proc.stdout + proc.stderr)[-2000:]
+
+
+class TestRunIsolation:
+    """B5 regression: a re-run must not mix stale artifacts into the new
+    Summary. After a run whose httpx phase produced nothing, the Summary must
+    show Live hosts: 0 (run 1's live/urls.txt must not leak)."""
+
+    def test_second_run_does_not_leak_stale_summary(self, rtw_env):
+        proc = run_engine([TARGET, "--scope-domain", SCOPE[0]])
+        out = proc.stdout + proc.stderr
+        assert proc.returncode == 0, out[-3000:]
+        assert "Live hosts:        2" in out
+        recon = rtw_env["recon_out"]
+
+        # simulate httpx disappearing between runs (bin_nohx scenario)
+        (rtw_env["stub_bin"] / "httpx").unlink()
+        proc2 = run_engine([TARGET, "--scope-domain", SCOPE[0]])
+        out2 = proc2.stdout + proc2.stderr
+        assert proc2.returncode == 0, out2[-3000:]
+        assert "Live hosts:        0" in out2, \
+            f"stale run-1 artifacts leaked into the Summary\n{out2[-2500:]}"
+        truth = json.loads((recon / "recon_truth.json").read_text())
+        assert truth["counts"]["live_hosts"] == 0
+        # the previous truth is kept as the delta baseline
+        assert (recon / ".prev_run" / "recon_truth.json").is_file()
+        delta = json.loads((recon / "delta.json").read_text())
+        assert delta["has_previous_run"] is True
+
+    def test_second_run_rebuilds_fresh_artifacts(self, rtw_env):
+        assert run_engine([TARGET, "--scope-domain", SCOPE[0]]).returncode == 0
+        recon = rtw_env["recon_out"]
+        (recon / "live" / "httpx_full.txt").write_text("STALE\n")
+        (recon / "urls" / "all.txt").write_text("STALE\n")
+        assert run_engine([TARGET, "--scope-domain", SCOPE[0]]).returncode == 0
+        assert "STALE" not in (recon / "live" / "httpx_full.txt").read_text()
+        assert "STALE" not in (recon / "urls" / "all.txt").read_text()
+
+
+class TestRunIncompleteMarker:
+    """B6 regression: an unclean previous run is recorded in the next truth
+    (previous_run_incomplete) and warned about."""
+
+    def test_marker_recorded_in_next_truth(self, rtw_env):
+        proc = run_engine([TARGET, "--scope-domain", SCOPE[0]])
+        out = proc.stdout + proc.stderr
+        assert proc.returncode == 0, out[-3000:]
+        truth = json.loads(
+            (rtw_env["recon_out"] / "recon_truth.json").read_text())
+        assert truth.get("previous_run_incomplete") is False
+        # simulate a killed run: the marker file was left behind
+        (rtw_env["recon_out"] / ".run_incomplete").write_text("killed\n")
+        proc2 = run_engine([TARGET, "--scope-domain", SCOPE[0]])
+        out2 = proc2.stdout + proc2.stderr
+        assert proc2.returncode == 0, out2[-3000:]
+        assert "did not complete" in out2
+        truth2 = json.loads(
+            (rtw_env["recon_out"] / "recon_truth.json").read_text())
+        assert truth2.get("previous_run_incomplete") is True
+        # a clean run clears the marker and the flag flips back
+        proc3 = run_engine([TARGET, "--scope-domain", SCOPE[0]])
+        assert proc3.returncode == 0
+        truth3 = json.loads(
+            (rtw_env["recon_out"] / "recon_truth.json").read_text())
+        assert truth3.get("previous_run_incomplete") is False
+        assert not (rtw_env["recon_out"] / ".run_incomplete").exists()

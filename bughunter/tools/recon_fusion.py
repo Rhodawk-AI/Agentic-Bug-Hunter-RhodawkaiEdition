@@ -771,6 +771,16 @@ def fuse(recon_dir: Path, target: str,
         previous = json.loads(truth_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         previous = None
+    if previous is None:
+        # B5: recon_engine.sh archives the previous run's truth under
+        # .prev_run/ and clears the recon dir before each run — the delta
+        # baseline lives there now.
+        try:
+            previous = json.loads(
+                (recon_dir / ".prev_run" / "recon_truth.json").read_text(
+                    encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = None
     if isinstance(previous, dict) and previous.get("schema_version"):
         try:
             (recon_dir / "recon_truth.prev.json").write_text(
