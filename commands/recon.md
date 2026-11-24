@@ -105,7 +105,7 @@ Or in your prompt: "Run `bash bughunter/tools/recon_engine.sh target.com` and re
 bash install_tools.sh
 ```
 
-Recon needs: `subfinder`, `dnsx`, `httpx` (ProjectDiscovery — not the Python CLI), `katana`, `gau`, `nuclei`, `ffuf`, `nmap`, `gf`, `anew`. The installer handles all of them.
+Recon needs: `subfinder`, `httpx` (ProjectDiscovery — not the Python CLI), `katana`, `gau`, `nuclei`, `ffuf`, `nmap`, `anew`. (`dnsx` and `gf` are optional conveniences the current engine does not invoke.) The installer handles all of them.
 
 ## After Recon
 
@@ -131,15 +131,12 @@ If after running this pipeline you see:
 
 The pipeline in `bughunter/tools/recon_engine.sh` runs these phases (numbers may shift; check the script source):
 
-1. **Subdomain enumeration** — subfinder + Chaos API (if `$CHAOS_API_KEY` set) + amass + crt.sh + wayback.
-2. **Live host discovery** — dnsx resolve, then httpx with status/title/tech-detect.
-3. **Port scan** — nmap top-1000 on live hosts (CIDR mode runs a wider sweep).
-4. **URL crawl** — katana deep crawl + waybackurls + gau historical.
-5. **gf classification** — xss, ssrf, idor, sqli, redirect, lfi candidate files.
-6. **JS analysis** — LinkFinder / SecretFinder on every JS bundle.
-7. **ffuf directory fuzzing** — uses `wordlists/common.txt` (run `python3 bughunter/tools/hunt.py --setup-wordlists` once if missing).
-8. **Parameter discovery** — Arjun / x8 against high-value endpoints.
-9. **Config exposure** — `.git/`, `.env`, `wp-config.php`, `.DS_Store`, swagger.json, etc.
-10. **CI/CD scan** — sisakulint against any GitHub Actions workflows discovered.
+The engine actually implements: subfinder (+ amass + crt.sh + wayback — no Chaos API call exists in the engine), httpx probing with status/title/tech-detect (no dnsx resolve step), origin-only nmap port scan (CDN/SaaS hosts are skipped), katana + gau/wayback URL collection, JS endpoint extraction via curl+sed (LinkFinder/SecretFinder are NOT wired in), ffuf directory fuzzing, parameter extraction from collected URLs (no Arjun/x8 active probing), config-file exposure checks, sisakulint CI/CD scan, and the reconFTW gap-fill phases 1.5/5.5. The following steps are commonly assumed but NOT implemented in `recon_engine.sh` — do not promise them in operator prompts:
+
+- ~~Chaos API subdomain enumeration~~ — not implemented (no `$CHAOS_API_KEY` code path).
+- ~~dnsx resolve before httpx~~ — not implemented (httpx does its own resolution).
+- ~~gf classification (xss/ssrf/idor/sqli/redirect/lfi candidate files)~~ — not implemented.
+- ~~LinkFinder / SecretFinder JS analysis~~ — not implemented (curl+sed extraction only).
+- ~~Arjun / x8 parameter discovery~~ — not implemented (parameter names are extracted from collected URLs only).
 
 For the IDOR / SSRF / GraphQL / SSTI / etc. active-testing playbooks, see `/hunt` and its methodology section.

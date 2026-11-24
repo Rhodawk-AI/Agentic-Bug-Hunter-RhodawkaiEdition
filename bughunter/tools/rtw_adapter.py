@@ -788,6 +788,11 @@ def run_capability(capability_id: str, target: str,
     digest = input_hash(spec, target, recon_dir)
 
     # Step 2 — native guard: never delegate what ABH owns.
+    # RESERVED (B8): NATIVE_CAPABILITY_IDS is an empty frozenset today, so no
+    # shipped capability ever takes this branch — it is deliberate dead code,
+    # kept as the spec-drift safety net: if a future registry version marks a
+    # capability NATIVE in capabilities.json, this guard refuses to delegate
+    # it (documented by tests/test_rtw_capability.py's native-skip test).
     state_map = load_state()
     if state_map.get(capability_id) == STATE_NATIVE:
         return _result(RESULT_SKIPPED, capability_id, target, digest=digest,
