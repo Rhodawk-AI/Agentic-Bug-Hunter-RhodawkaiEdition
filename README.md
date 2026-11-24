@@ -13,6 +13,15 @@
 [![PyPI](https://img.shields.io/pypi/v/agentic-bug-hunter-rhodawkai-edition?style=for-the-badge&logo=pypi&logoColor=white&color=3775A9)](https://pypi.org/project/agentic-bug-hunter-rhodawkai-edition/)
 [![npm](https://img.shields.io/npm/v/agentic-bug-hunter-rhodawkai-edition?style=for-the-badge&logo=npm&logoColor=white&color=CB3837)](https://www.npmjs.com/package/agentic-bug-hunter-rhodawkai-edition)
 
+   <p align="center">
+     <a href="./PLAYBOOK.md">🚀 5-Min Operator Playbook</a> •
+     <a href="./benchmarks.md">📊 Live Benchmarks</a> •
+     <a href="./CONTRIBUTING.md">Contributing</a> •
+     <a href="./LICENSE">MIT License</a>
+   </p>
+   
+
+
 
 **[Demo](#-live-demo) · [What Is This](#-what-is-this) · [Benchmark](#-head-to-head-benchmark) · [Quick Start](#-quick-start-5-commands) · [AI Providers](#-open-weight--multi-provider-ai) · [reconFTW Delegation](#-deterministic-reconftw-delegation) · [Commands & MCP](#-cli-commands-mcp--project-structure) · [Acknowledgments](#-acknowledgments--branded-footer)**
 
