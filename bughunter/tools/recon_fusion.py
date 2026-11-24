@@ -791,8 +791,23 @@ def fuse(recon_dir: Path, target: str,
     else:
         previous = None
 
+    # B6: recon_engine.sh archives a leftover .run_incomplete marker to
+    # .prev_run/ at startup — its presence means the PREVIOUS run never
+    # reached a clean exit. Record it in this run's truth and warn.
+    previous_run_incomplete = (recon_dir / ".prev_run" / "run_incomplete").is_file()
+    if previous_run_incomplete:
+        print("[!] previous recon run did not complete cleanly — "
+              "previous_run_incomplete=true recorded in recon_truth.json",
+              file=sys.stderr)
+        # consume-once: the flag describes exactly the run before this one
+        try:
+            (recon_dir / ".prev_run" / "run_incomplete").unlink()
+        except OSError:
+            pass
+
     truth = build_truth(recon_dir, target, scope_domains, scope_excluded)
     truth["scope_enforced"] = bool(scope_enforced)
+    truth["previous_run_incomplete"] = bool(previous_run_incomplete)
     truth_path.write_text(json.dumps(truth, indent=2, sort_keys=True) + "\n",
                           encoding="utf-8")
 

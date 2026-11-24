@@ -432,11 +432,21 @@ export HTTPX_BIN
 # truth stays available to recon_fusion.py via .prev_run/recon_truth.json.
 if [ -d "$RECON_DIR" ] && [ -n "$(ls -A "$RECON_DIR" 2>/dev/null)" ]; then
     mkdir -p "$RECON_DIR/.prev_run"
+    # B6: a leftover .run_incomplete marker means the previous run never
+    # reached a clean exit (killed watchdog, crashed phase) — warn and archive
+    # it so fuse records previous_run_incomplete=true in this run's truth.
+    if [ -f "$RECON_DIR/.run_incomplete" ]; then
+        log_warn "Previous recon run for $TARGET did not complete cleanly — artifacts archived to .prev_run; previous_run_incomplete will be recorded"
+        mv -f "$RECON_DIR/.run_incomplete" "$RECON_DIR/.prev_run/run_incomplete"
+    fi
     [ -f "$RECON_DIR/recon_truth.json" ] && \
         mv -f "$RECON_DIR/recon_truth.json" "$RECON_DIR/.prev_run/recon_truth.json"
     find "$RECON_DIR" -mindepth 1 -maxdepth 1 -not -name '.prev_run' \
         -exec rm -rf {} + 2>/dev/null || true
 fi
+
+# B6: mark this run incomplete until a clean exit removes the marker.
+touch "$RECON_DIR/.run_incomplete"
 
 mkdir -p "$RECON_DIR"/{subdomains,live,ports,urls,js,dirs,params}
 
@@ -1372,3 +1382,8 @@ echo "    ./tools/vuln_scanner.sh $RECON_DIR        # active vuln probes"
 echo "    ./tools/takeover_scanner.sh --recon $RECON_DIR   # confirm CNAME takeovers"
 echo "    ./tools/secrets_hunter.sh --js-bundle $RECON_DIR  # leaked-cred sweep"
 echo "============================================="
+
+# B6: clean exit — remove the run-incomplete marker so the next run does not
+# report previous_run_incomplete. If the engine is killed before this point
+# the marker survives and the next run records + warns about the interruption.
+rm -f "$RECON_DIR/.run_incomplete"
