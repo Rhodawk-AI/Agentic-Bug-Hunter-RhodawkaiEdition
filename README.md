@@ -63,6 +63,17 @@ All three runners, same target (`rhodawkai.com`), same 8-vCPU / 32 GB Ubuntu VPS
 | 🟢 RhodawkAI Edition | **`~5m 00s`** | **`0s` / `0` packets** on CDN edges; bounded `-c` gap-fillers (`0.4s–0.5s` each) | Fail-closed scope gate, `recon_truth.json` (`2` hosts → `1` SimHash cluster), `delta.json`, 6-row `tool_health`, NVIDIA NIM `recon_brief.md` |
 
 ---
+---
+<p align="center">
+  <a href="#-quick-start">Quick Start</a> •
+  <a href="./benchmarks.md">📊 Live Benchmarks</a> •
+  <a href="./CONTRIBUTING.md">Contributing</a> •
+  <a href="./SECURITY.md">Security</a> •
+  <a href="./LICENSE">MIT License</a>
+</p>
+
+---
+
 
 ## 🚀 Quick Start (5 Commands)
 
