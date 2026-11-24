@@ -98,6 +98,22 @@ done
 [ -n "$TARGET" ] || { _rtw_engine_usage >&2; exit 1; }
 BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Flatten (repeatable + comma-separated) scope patterns ONCE — used by the
+# pre-flight scope gate AND the B2 redirect-destination classification.
+SC_CHECK_ARGS=()
+for _p in ${SCOPE_DOMAIN_ARGS[@]+"${SCOPE_DOMAIN_ARGS[@]}"}; do
+    IFS=',' read -r -a _sc_parts <<< "$_p"
+    for _c in "${_sc_parts[@]}"; do
+        [ -n "$_c" ] && SC_CHECK_ARGS+=(--domain "$_c")
+    done
+done
+for _p in ${SCOPE_EXCLUDE_ARGS[@]+"${SCOPE_EXCLUDE_ARGS[@]}"}; do
+    IFS=',' read -r -a _sc_parts <<< "$_p"
+    for _c in "${_sc_parts[@]}"; do
+        [ -n "$_c" ] && SC_CHECK_ARGS+=(--exclude-domain "$_c")
+    done
+done
+
 # ── reconFTW gap-fill plumbing (RhodawkAI Edition, Fixes 1+2) ─────────────────
 # Deterministic delegation to reconFTW's equivalent functions via
 # tools/rtw_adapter.py — never an LLM judgment call. Two split phases:
@@ -304,21 +320,6 @@ elif [ "$TARGET_TYPE" != "domain" ]; then
 elif [ ${#SCOPE_DOMAIN_ARGS[@]} -eq 0 ]; then
     SCOPE_GATE_BLOCK="no --scope-domain pattern provided (fail-closed pre-flight gate)"
 else
-    SC_CHECK_ARGS=()
-    # Repeatable and comma-separated patterns are both accepted (same
-    # flattening the rtw_adapter applies before its own ScopeChecker call).
-    for _p in ${SCOPE_DOMAIN_ARGS[@]+"${SCOPE_DOMAIN_ARGS[@]}"}; do
-        IFS=',' read -r -a _sc_parts <<< "$_p"
-        for _c in "${_sc_parts[@]}"; do
-            [ -n "$_c" ] && SC_CHECK_ARGS+=(--domain "$_c")
-        done
-    done
-    for _p in ${SCOPE_EXCLUDE_ARGS[@]+"${SCOPE_EXCLUDE_ARGS[@]}"}; do
-        IFS=',' read -r -a _sc_parts <<< "$_p"
-        for _c in "${_sc_parts[@]}"; do
-            [ -n "$_c" ] && SC_CHECK_ARGS+=(--exclude-domain "$_c")
-        done
-    done
     if ! python3 "$BASE_DIR/tools/scope_checker.py" \
             ${SC_CHECK_ARGS[@]+"${SC_CHECK_ARGS[@]}"} "$TARGET" >/dev/null 2>&1; then
         SCOPE_GATE_BLOCK="target '$TARGET' is outside the provided scope patterns"
@@ -626,6 +627,65 @@ if [ -x "$HTTPX_BIN" ] && [ -s "$RECON_DIR/subdomains/all.txt" ]; then
     log_done "3xx Redirect: $(wc -l < "$RECON_DIR/live/status_3xx.txt" 2>/dev/null || echo 0)"
     log_done "403 Forbidden: $(wc -l < "$RECON_DIR/live/status_403.txt" 2>/dev/null || echo 0)"
     log_done "401 Auth Required: $(wc -l < "$RECON_DIR/live/status_401.txt" 2>/dev/null || echo 0)"
+
+    # B2: when scoped, httpx no longer follows redirects blindly (above). A
+    # redirect destination is RECORDED as a finding in live/redirects.txt and
+    # probed ONLY if it is in scope: the Location is read with an in-scope
+    # HEAD request (curl, bounded), classified through the same scope rules
+    # as every other asset, and only in-scope destinations enter a bounded
+    # second httpx pass. Out-of-scope destinations are never fetched.
+    if [ "${SCOPE_ENFORCED:-0}" = "1" ] && [ -s "$RECON_DIR/live/status_3xx.txt" ] \
+       && command -v curl &>/dev/null; then
+        log_step "Scoped redirect handling: recording destinations (no blind follow)..."
+        : > "$RECON_DIR/live/redirects.txt"
+        : > "$RECON_DIR/live/redirects_inscope.txt"
+        _redir_n=0
+        while IFS= read -r _line && [ "$_redir_n" -lt 50 ]; do
+            _url=$(printf '%s' "$_line" | awk '{print $1}')
+            [ -z "$_url" ] && continue
+            _loc=$(curl -sI --max-time 5 ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} "$_url" 2>/dev/null \
+                | awk 'tolower($1)=="location:"{sub(/\r$/,"",$2); print $2; exit}')
+            [ -z "$_loc" ] && continue
+            _dest_host=$(printf '%s' "$_loc" | sed 's|https\?://||;s|[/:].*||')
+            _dest_port=$(printf '%s' "$_loc" | sed -nE 's|https?://[^/]*:([0-9]+).*|\1|p')
+            _in_scope=0
+            if [ ${#SCOPE_DOMAIN_ARGS[@]} -gt 0 ]; then
+                python3 "$BASE_DIR/tools/scope_checker.py" \
+                    ${SC_CHECK_ARGS[@]+"${SC_CHECK_ARGS[@]}"} "$_loc" >/dev/null 2>&1 && _in_scope=1
+            else
+                # Self-scoped target: the destination host must match the
+                # target host — and when the target carries an explicit port
+                # (host:port lab target), the destination must use that port.
+                if [ "$_dest_host" = "$TARGET" ]; then
+                    if [ -n "$TARGET_PORT" ]; then
+                        [ "$_dest_port" = "$TARGET_PORT" ] && _in_scope=1
+                    else
+                        _in_scope=1
+                    fi
+                fi
+            fi
+            if [ "$_in_scope" = "1" ]; then
+                printf '[IN-SCOPE] %s <- redirect from %s\n' "$_loc" "$_url" >> "$RECON_DIR/live/redirects.txt"
+                printf '%s\n' "$_loc" >> "$RECON_DIR/live/redirects_inscope.txt"
+            else
+                printf '[OOS] %s <- redirect from %s (recorded, NOT probed)\n' "$_loc" "$_url" >> "$RECON_DIR/live/redirects.txt"
+                log_info "Redirect destination out of scope — recorded, not probed: $_loc"
+            fi
+            _redir_n=$((_redir_n + 1))
+        done < "$RECON_DIR/live/status_3xx.txt"
+        if [ -s "$RECON_DIR/live/redirects_inscope.txt" ]; then
+            log_step "Probing in-scope redirect destinations only..."
+            sort -u -o "$RECON_DIR/live/redirects_inscope.txt" "$RECON_DIR/live/redirects_inscope.txt"
+            "$HTTPX_BIN" -l "$RECON_DIR/live/redirects_inscope.txt" \
+                -silent -status-code -threads "$THREADS" -rate-limit "$RATE_LIMIT" \
+                ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} \
+                -o "$RECON_DIR/live/httpx_redirect_probe.txt" 2>/dev/null || true
+            [ -s "$RECON_DIR/live/httpx_redirect_probe.txt" ] && \
+                cat "$RECON_DIR/live/httpx_redirect_probe.txt" >> "$RECON_DIR/live/httpx_full.txt"
+            awk '{print $1}' "$RECON_DIR/live/httpx_full.txt" 2>/dev/null | sort -u > "$RECON_DIR/live/urls.txt" || true
+            LIVE_COUNT=$(wc -l < "$RECON_DIR/live/urls.txt" 2>/dev/null || echo 0)
+        fi
+    fi
 else
     if ! [ -x "$HTTPX_BIN" ]; then
         warn_missing httpx "HTTP probing"

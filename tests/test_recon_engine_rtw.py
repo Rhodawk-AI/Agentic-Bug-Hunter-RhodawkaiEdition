@@ -15,6 +15,7 @@ checkout (no network, no real scanners needed):
 3. RTW_HOME unset → engine behaves as upstream (gap-fill skipped, no crash).
 """
 
+import argparse
 import json
 import os
 import subprocess
@@ -413,3 +414,176 @@ class TestShorthandAndHonestRecon:
         assert "Delta vs previous run" in out2
         # Step 1B fix 4: the 7-row recon health table prints at the end.
         assert "Capability" in out2 and "Net-New" in out2
+
+
+class TestScopedRedirectEnforcement:
+    """B2 regression: engine.py cmd_recon/cmd_hunt must set SCOPE_ENFORCED=1
+    whenever scoping is active (explicit patterns or the self-scoped local
+    path), so recon_engine.sh runs httpx WITHOUT -follow-redirects. A local
+    301 to an out-of-scope listener must receive 0 requests, the destination
+    must not appear in live/httpx_full.txt or live/urls.txt, and the
+    destination is recorded as a finding in live/redirects.txt."""
+
+    def test_cmd_recon_and_hunt_set_scope_enforced(self, monkeypatch):
+        """Unit: SCOPE_ENFORCED=1 whenever scoping is active; absent for
+        --no-scope-check. Matches hunt.py run_recon's rule."""
+        sys.path.insert(0, str(REPO_ROOT / "bughunter"))
+        import engine
+        captured = {}
+
+        def fake_run_shell(cmd, cwd=None, timeout=3600, env=None):
+            captured["env"] = dict(env or {})
+            return True, ""
+
+        monkeypatch.setattr(engine, "_run_shell", fake_run_shell)
+
+        class _FakeBrain:
+            def analyze_recon(self, *a, **k):
+                return "ok"
+
+            def interpret_scan(self, *a, **k):
+                return "ok"
+
+        monkeypatch.setattr(engine, "_get_brain", lambda: _FakeBrain())
+        ns = argparse.Namespace(target="127.0.0.1:8080", scope_domain=[],
+                                scope_exclude=[], no_scope_check=False)
+        engine.cmd_recon(ns)
+        assert captured["env"].get("SCOPE_ENFORCED") == "1"
+        assert captured["env"].get("RECON_OUT_DIR")
+        ns.no_scope_check = True
+        engine.cmd_recon(ns)
+        assert "SCOPE_ENFORCED" not in captured["env"]
+        ns.no_scope_check = False
+        ns.scope_domain = ["*.example.test"]
+        engine.cmd_recon(ns)
+        assert captured["env"].get("SCOPE_ENFORCED") == "1"
+        engine.cmd_hunt(argparse.Namespace(
+            target="127.0.0.1:8080", scope_domain=[], scope_exclude=[],
+            no_scope_check=False))
+        assert captured["env"].get("SCOPE_ENFORCED") == "1"
+
+    def test_scoped_recon_does_not_follow_redirects(self, rtw_env, tmp_path):
+        """Integration: two real localhost listeners — A (target) 301s to B
+        (out of scope). Before the fix the scoped CLI run hopped to B (>=1
+        request, destination in outputs); after the fix B sees 0 requests,
+        the destination is only recorded in live/redirects.txt."""
+        import http.server
+        import threading
+
+        counts = {"a": 0, "b": 0}
+
+        class HandlerB(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                counts["b"] += 1
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"<html><title>OOS</title></html>")
+
+            def log_message(self, *a):
+                pass
+
+        class HandlerA(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                counts["a"] += 1
+                self.send_response(301)
+                self.send_header(
+                    "Location",
+                    f"http://127.0.0.1:{srv_b.server_port}/")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv_a = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), HandlerA)
+        srv_b = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), HandlerB)
+        for srv in (srv_a, srv_b):
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        # A fetching httpx stub: without -follow-redirects a 3xx is recorded
+        # but NOT followed; with it, the Location host is fetched (counted).
+        stub_bin = rtw_env["stub_bin"]
+        httpx_fetch = stub_bin / "httpx"
+        httpx_fetch.write_text(f'''#!/usr/bin/env python3
+import sys, urllib.request, urllib.error
+args = sys.argv[1:]
+if "-version" in args:
+    print("httpx 1.3.5 projectdiscovery"); sys.exit(0)
+follow = "-follow-redirects" in args
+in_file = out_file = None
+i = 0
+while i < len(args):
+    if args[i] == "-l": in_file = args[i + 1]
+    if args[i] == "-o": out_file = args[i + 1]
+    i += 1
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+opener = urllib.request.build_opener(NoRedirect)
+lines = []
+if in_file:
+    lines = [l.strip() for l in open(in_file, encoding="utf-8") if l.strip()]
+with open(out_file, "w", encoding="utf-8") as out:
+    for line in lines:
+        url = line if "://" in line else "http://" + line
+        try:
+            r = (urllib.request.urlopen(url, timeout=5) if follow
+                 else opener.open(url, timeout=5))
+            out.write(f"{{r.url}} [{{r.status}}] [LAB] [stub] [10]\\n")
+        except urllib.error.HTTPError as e:
+            out.write(f"{{url}} [{{e.code}}] [redirect] [stub] [0]\\n")
+        except Exception:
+            pass
+''')
+        httpx_fetch.chmod(0o755)
+        # curl stub answers the scoped HEAD with the redirect Location so the
+        # destination is recorded as a finding.
+        curl_stub = stub_bin / "curl"
+        curl_stub.write_text(
+            "#!/bin/bash\n"
+            'echo "HTTP/1.1 301 Moved Permanently"\n'
+            f'echo "Location: http://127.0.0.1:{srv_b.server_port}/"\n'
+            "exit 0\n")
+        curl_stub.chmod(0o755)
+
+        target = f"127.0.0.1:{srv_a.server_port}"
+        env = os.environ.copy()
+        env.update({
+            "BUGHUNTER_HOME": str(rtw_env["home"]),
+            "BUGHUNTER_CAPABILITIES_FILE": str(rtw_env["capabilities"]),
+        })
+        proc = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "bughunter" / "engine.py"),
+             "recon", target],
+            cwd=str(REPO_ROOT), env=env, capture_output=True, text=True,
+            timeout=300)
+        out = proc.stdout + proc.stderr
+
+        try:
+            assert counts["b"] == 0, (
+                f"out-of-scope listener received {counts['b']} request(s)\n"
+                f"{out[-3000:]}")
+            recon = rtw_env["home"] / "recon" / f"127.0.0.1_{srv_a.server_port}"
+            if not recon.is_dir():  # C10 keying may vary pre/post fix
+                legacy = rtw_env["home"] / "recon" / "127.0.0.1"
+                recon = legacy if legacy.is_dir() else recon
+            dest = f"http://127.0.0.1:{srv_b.server_port}"
+            httpx_full = (recon / "live" / "httpx_full.txt")
+            urls = (recon / "live" / "urls.txt")
+            if httpx_full.exists():
+                assert dest not in httpx_full.read_text(), \
+                    "redirect destination leaked into live/httpx_full.txt"
+            if urls.exists():
+                assert dest not in urls.read_text(), \
+                    "redirect destination leaked into live/urls.txt"
+            redirects = (recon / "live" / "redirects.txt")
+            assert redirects.is_file() and dest in redirects.read_text(), \
+                "redirect destination not recorded as a finding"
+            assert "recorded, NOT probed" in redirects.read_text()
+        finally:
+            srv_a.shutdown()
+            srv_b.shutdown()
+            srv_a.server_close()
+            srv_b.server_close()
