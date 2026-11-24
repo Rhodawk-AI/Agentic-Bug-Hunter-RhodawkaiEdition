@@ -1,82 +1,153 @@
-Agentic-Bug-Hunter — RhodawkAI Edition (v6.1.0)
-================================================
+Agentic-Bug-Hunter — RhodawkAI Edition
+========================================================================
 
 WHAT THIS ARCHIVE IS
 --------------------
 The COMPLETE source tree of Agentic-Bug-Hunter with the RhodawkAI Edition
-integration applied — every file from upstream is included, not a patch or a
-delta. 454 of the 461 files in this archive are byte-identical to upstream
-agentic-bug-hunter at the pinned commit; the remaining 23 are listed below.
+integration applied — version 6.1.1.1. This manifest is REGENERATED from
+the real git data of this tree (git diff --name-status 82f4512e..HEAD);
+it replaces the stale v6.1.0 manifest whose arithmetic did not add up
+("454 of the 461 files byte-identical ... the remaining 23" = 477, not
+461) and whose lists omitted files.
 
 Base project:  awarexone/agentic-bug-hunter
-Base commit:   82f4512ec432765297c36e6b3ef7dc3fe5a58be2  (upstream 6.0.1)
-Fork edition:  agentic-bug-hunter-rhodawkai-edition 6.1.0
+Base commit:   82f4512ec432765297c36e6b3ef7dc3fe5a58be2  (upstream 6.0.1, tree = 454 files)
+ Edition:      agentic-bug-hunter-rhodawkai-edition 6.1.1.1
+Release tag:   v6.1.1.1 (this tree)
+This tree:     462 files
 
-Integration tested against (cloned separately by ./install.sh into RTW_HOME,
-default ~/Tools/reconftw — NOT included in this archive):
+Diff vs base commit: 47 modified, 27 added, 19 deleted (git diff --name-status, exact). Every file not
+listed below is byte-identical to the base commit.
+
+Integration tested against (cloned separately by ./install.sh into
+RTW_HOME, default ~/Tools/reconftw — NOT included in this archive):
   six2dez/reconftw @ 39252113a854bdac0b785f144b9fae1fa8ca35fc
 
-The one functional addition: wherever ABH's own recon pipeline hits a
-capability it doesn't have, it delegates to reconFTW's equivalent function —
-deterministically (capability_registry.py + rtw_adapter.py), in all four
-runtimes (CLI engine, ReAct agent, interactive harness, MCP server), fail-closed
-on scope, with modules/vulns.sh never delegated. See the "RhodawkAI Edition"
-lead section of README.md and CHANGELOG.md for the full capability map.
+FUNCTIONAL FEATURE SET OF THIS EDITION (recon phase)
+----------------------------------------------------
+The v6.1.0 manifest called reconFTW delegation 'the one functional
+addition'. That was wrong — the real set:
+  1. Scope plumbing: repeatable --scope-domain/--scope-exclude flags and
+     a fail-closed pre-flight scope gate in recon_engine.sh; ScopeChecker
+     filtering of every discovered host/URL list before probing.
+  2. reconFTW delegation: capability_registry.py + rtw_adapter.py running
+     7 pinned -c <fn> gap-fill modules (phases 1.5/5.5) with honest
+     per-capability tool_health accounting (rtw_manifest.json).
+  3. CDN/origin classification (recon_fusion.py classify) — nmap runs on
+     FIRST_PARTY_ORIGIN targets only; CDN edges and SaaS endpoints are
+     explicitly skipped.
+  4. Canonical fusion: recon_truth.json + delta.json (SimHash host
+     clustering, provenance, input_integrity, scope accounting).
+  5. NVIDIA NIM provider (brain.py) for recon analysis.
+  6. `rhodawk doctor` environment/pin/capability audit.
+  7. Managed Chromium wiring for katana headless SPA crawling.
+  8. npm wrapper package + PyPI release (rhodawk CLI entrypoint).
 
-FILES MODIFIED vs UPSTREAM (17)
--------------------------------
-CHANGELOG.md                          Edition changelog entry + version notes
-README.md                             RhodawkAI Edition lead section + capability table
-go.mod                                Fork-edition comment (module path unchanged)
-pyproject.toml                        name agentic-bug-hunter-rhodawkai-edition, version 6.1.0
-install.sh                            Post-dispatch reconFTW pinned-clone + capabilities.json rebuild
-install_tools.sh                      --rtw-deps mode (pinned per-capability go-install only)
-bughunter/agent.py                    run_rtw_capability tool schema (7-ID enum), dispatch branch,
-                                      NETWORK_TOOLS/TOOL_METHODS, AGENT_SYSTEM rule 3
-bughunter/engine.py                   recon/hunt --scope-domain/--scope-exclude/--no-scope-check flags
-                                      forwarded to recon_engine.sh
-bughunter/tools/hunt.py               run_recon forwards active ScopeChecker patterns to recon_engine.sh
-bughunter/tools/recon_engine.sh       Flag parsing (scope flags, --normalize-only preserved),
-                                      Phase 1.5 + Phase 5.5 gap-fill with merges, Summary block
-bughunter/agents/recon-agent.md       reconFTW Gap-Fill section (same rule wording as agent.py)
-commands/recon.md                     reconFTW Gap-Fill section + rtw/ output dir in tree
-skills/web2-recon/SKILL.md            reconFTW GAP-FILL section with capability map
-docs/CAPABILITY-GAPS.md               Recon gaps marked closed via delegation + guardrails
-bughunter/mcp/bughunter-mcp/server.py bughunter_run_rtw_capability MCP tool (26th tool)
-bughunter/mcp/bughunter-mcp/adapters.py
-                                      run_rtw_capability adapter + scope forwarding in run_recon
-bughunter/mcp/bughunter-mcp/policy/tool_meta.py
-                                      Policy metadata for the new MCP tool (scope+approval required)
+FILES MODIFIED vs UPSTREAM (47)
+----------------------------------------
+  AQ.md
+  DOPTERS.md
+  EADME.md
+  ERMS.md
+  HANGELOG.md
+  KILL.md
+  PENCODE.md
+  claude-plugin/plugin.json
+  emo/app.py
+  ests/conftest.py
+  ests/test_brain_auto_detect.py
+  ests/test_scope_checker.py
+  ests/test_target_normalize.py
+  github/CODE_OF_CONDUCT.md
+  github/CONTRIBUTING.md
+  github/FUNDING.yml
+  github/SECURITY.md
+  gitignore
+  ite/README.md
+  ite/index.html
+  kills/bug-bounty/SKILL.md
+  kills/web2-recon/SKILL.md
+  nstall.sh
+  nstall_tools.sh
+  o.mod
+  ocs/CAPABILITY-GAPS.md
+  ocs/TUTORIAL.md
+  ommands/recon.md
+  ughunter/agent.py
+  ughunter/agents/recon-agent.md
+  ughunter/brain.py
+  ughunter/engine.py
+  ughunter/mcp/bughunter-mcp/README.md
+  ughunter/mcp/bughunter-mcp/adapters.py
+  ughunter/mcp/bughunter-mcp/policy/tool_meta.py
+  ughunter/mcp/bughunter-mcp/server.py
+  ughunter/memory/redaction.py
+  ughunter/serve.py
+  ughunter/tools/banner.py
+  ughunter/tools/banner.sh
+  ughunter/tools/h1_mutation_idor.py
+  ughunter/tools/hai_payload_builder.py
+  ughunter/tools/hunt.py
+  ughunter/tools/recon_engine.sh
+  ughunter/tools/scope_checker.py
+  ughunter/tools/target_normalize.py
+  yproject.toml
 
-FILES ADDED (6)
----------------
-bughunter/tools/capability_registry.py  Boot-time tool binding -> ~/.bughunter/capabilities.json
-                                        {capability_id: NATIVE|RTW_AVAILABLE|RTW_MISSING_DEPS}
-bughunter/tools/rtw_adapter.py          Deterministic six-step delegation + rtw_manifest.json
-tests/test_rtw_capability.py            28 unit tests (registry + adapter acceptance criteria)
-tests/test_recon_engine_rtw.py          11 engine-level tests (pipeline order, CLI scope gate, merges)
-tests/test_mcp_rtw.py                   9 MCP runtime tests (policy gate + shared manifest schema)
-tests/test_agent_rtw_dispatch.py        5 ReAct-dispatch runtime tests (guard + shared schema)
+FILES ADDED vs UPSTREAM (27)
+----------------------------------------
+  ENCHMARKS.md
+  LAYBOOK.md
+  UILD-MANIFEST.txt
+  ests/test_agent_rtw_dispatch.py
+  ests/test_mcp_rtw.py
+  ests/test_nvidia_nim.py
+  ests/test_recon_engine_rtw.py
+  ests/test_recon_fusion.py
+  ests/test_rtw_capability.py
+  ests/test_step3_hygiene.py
+  github/benchmarks.md
+  github/workflows/ci.yml
+  ocs/workflow-ci.yml
+  pm/LICENSE
+  pm/README.md
+  pm/bin/rhodawk.js
+  pm/package.json
+  ssets/architecture.png
+  ssets/benchmark.png
+  ssets/rhodawk-banner.png
+  ssets/rhodawk-demo-1080p.mp4
+  ssets/rhodawk-demo.gif
+  ssets/rhodawkai-logo.png
+  ssets/rhodawkai-logo.webp
+  ughunter/tools/capability_registry.py
+  ughunter/tools/recon_fusion.py
+  ughunter/tools/rtw_adapter.py
 
-TEST STATUS (run from the archive root)
----------------------------------------
-- Full ABH pytest suite: 1211 passed, 1 skipped, 0 failed
-  (the skip is the MCP-server live import, unavailable MCPServer API in the
-  build sandbox; its wiring is statically verified instead)
-- reconFTW bats --unit suite at the pinned commit: passed
-- Acceptance script (pipeline order, real-reconftw interface, 4-runtime
-  parity): 27/27 checks passed
+FILES DELETED vs UPSTREAM (19)
+----------------------------------------
+  etflix-privacy-analysis/README.md
+  etflix-privacy-analysis/build_guide_spec.py
+  etflix-privacy-analysis/build_privacy_spec.py
+  etflix-privacy-analysis/output/Netflix_PrivacyHardening_OptOut_Guide.pdf
+  etflix-privacy-analysis/output/Netflix_Privacy_Statement_2026_Verbatim.pdf
+  etflix-privacy-analysis/output/opt_out_guide_spec.json
+  etflix-privacy-analysis/output/privacy_statement_spec.json
+  etflix-privacy-analysis/sources/node_100637_raw.md
+  etflix-privacy-analysis/sources/privacy_statement_raw.md
+  etflix-privacy-analysis/sources/supporting_nodes_raw.md
+  github/workflows/tests.yml
+  ssets/apply-case-review-btn.png
+  ssets/awarexone-logo.webp
+  ssets/banner.png
+  ssets/fluxion-logo.png
+  ssets/fluxion-partner-banner.jpg
+  ssets/infistar.jpg
+  ssets/sidrune-partner-banner.png
+  ssets/socialsafe-blurb.png
 
-QUICK START
------------
-  unzip agentic-bug-hunter-rhodawkai-edition-6.1.0.zip
-  cd agentic-bug-hunter-rhodawkai-edition-6.1.0
-  ./install.sh                        # installs ABH + clones reconFTW pinned
-  bash install_tools.sh               # ABH-native tools
-  bash install_tools.sh --rtw-deps    # the 7 gap-fill capabilities' binaries only
-  python3 bughunter/tools/capability_registry.py --banner
+TESTS
+--------------------
+  `pytest -q` on this tree: 1312 passed
+  upstream 82f4512e: 1159 passed; 6.1.0 snapshot (9d6f8d2): 1212 passed
 
-  # Recon with gap-fill (scope patterns are forwarded to the adapter):
-  bughunter recon target.com --scope-domain "*.target.com"
-
-  # Without RTW_HOME set, everything behaves exactly as upstream ABH.
+Archive layout unchanged: unzip, cd, `bash install.sh`.

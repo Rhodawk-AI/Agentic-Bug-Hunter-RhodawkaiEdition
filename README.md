@@ -251,7 +251,7 @@ Agentic-Bug-Hunter-RhodawkaiEdition/
 ├── .github/workflows/ci.yml   # green CI gate: bash -n + pytest -q on every push/PR
 ├── install.sh                 # standalone install · pinned reconFTW clone · 'rhodawk' alias
 ├── install_tools.sh           # subfinder · httpx · nuclei · katana · ffuf · nmap · … + --browser Chromium
-├── pyproject.toml             # package metadata — agentic-bug-hunter-rhodawkai-edition 6.1.0
+├── pyproject.toml             # package metadata — agentic-bug-hunter-rhodawkai-edition 6.1.1.1
 └── requirements.txt           # requests · pytest · mcp
 ```
 

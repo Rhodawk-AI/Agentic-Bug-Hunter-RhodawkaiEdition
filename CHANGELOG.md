@@ -1,6 +1,33 @@
 # Changelog
 
-## Unreleased — RhodawkAI Edition (6.1.0)
+## 6.1.1.1 — DD hardening (recon)
+
+### Fixed
+- **[B1] `--no-scope-check` no longer kills canonical fusion** — `recon_fusion.py fuse` accepts the flag and records `scope_enforced: false`; a failed fuse prints a visible `CANONICAL FUSION FAILED` warning and records a `FAILED` `FUSION` row in `rtw_manifest.json` (tool_health) instead of being swallowed.
+- **[B2] Scoped CLI recon/hunt stop following redirects out of scope** — `engine.py cmd_recon/cmd_hunt` set `SCOPE_ENFORCED=1` whenever scoping is active; redirect destinations are recorded as findings in `live/redirects.txt`, classified through the same scope rules, and only in-scope destinations are probed.
+- **[B3] Discovered out-of-scope hosts/URLs are filtered before probing** — the engine applies the ScopeChecker filter at the four merge points (post-Phase-1, post-1.5, post-URL-collection, post-5.5); dropped lines land in `<recon_dir>/scope/dropped_oos.txt` and the count in the Summary + `recon_truth.json` (`counts.scope_dropped`).
+- **[B4] `delta.json` port attribution** — open ports are attributed only to hosts they can be joined to (nmap target hostname, or an IP with exactly ONE resolving host); anything unjoinable goes to `unattributed_ports` (the shared-loopback E9 case no longer reports port 80 on unrelated hosts).
+- **[B5] Re-runs are isolated from stale artifacts** — each run archives the previous truth to `.prev_run/` and clears the rest; the Summary counts the current run only (`Live hosts: 0` when httpx is gone).
+- **[B6] `.run_incomplete` marker** — a killed run is recorded as `previous_run_incomplete: true` in the next truth with a warning.
+- **[B7] Fusion certifies its inputs** — `input_integrity` per input file (ok/empty/missing/unparseable); an unparseable required input sets `status: DEGRADED` (exit code unchanged).
+- **[C10] host:port targets key their own recon dir** (`127.0.0.1_8082`) across target_normalize/engine.py/hunt.py/recon_engine.sh.
+- **[PIN] The adapter re-verifies the reconFTW commit at run time** — HEAD != `RTW_COMMIT_PIN` returns SKIPPED ('pin mismatch') and records it for tool_health.
+- **[UX] `:port` / `/path` scope patterns warn at construction** instead of failing closed silently.
+- **[B9] README `tool_health` status names match the adapter enum**; `commands/recon.md` marks dnsx/Chaos/gf/Arjun/LinkFinder steps as NOT implemented.
+- **[B10] BUILD-MANIFEST.txt regenerated from the real git diff with correct counts, test totals and version; "454 of 461 byte-identical" wording fixed; the "one functional addition" claim replaced with the real feature set.
+
+### Docs
+- README/PLAYBOOK: "0 packets" claims scoped to the blocked target; discovered hosts are filtered before probing; `--no-scope-check` disables scoping; recon output path corrected (both `~/.bughunter/recon/` and the writable-clone `bughunter/recon/` layouts documented).
+- BENCHMARKS.md: new "Limitations" section (single run per cell, scoped-vs-unscoped comparison caveat, 3-of-5 slower targets, reconFTW DNF wording, unexplained Live hosts=0, single-target CDN savings).
+
+## 6.1.1 — npm + PyPI release
+
+### Added
+- **PyPI release 6.1.1** with the `rhodawk` CLI entrypoint (`pyproject.toml` console script).
+- **npm package** `agentic-bug-hunter-rhodawkai-edition@6.1.1` (CLI wrapper publishing the `rhodawk` command).
+- **BENCHMARKS.md** — timed 3-way recon benchmark (RhodawkAI Edition vs upstream ABH vs standalone reconFTW) against 5 authorized domains, with per-domain timings and honest telemetry notes.
+
+## 6.1.0 — RhodawkAI Edition
 
 ### Added
 - **reconFTW on-demand capability delegation (recon phase only)** — wherever ABH's own recon pipeline hits a capability it doesn't have, it transparently delegates to reconFTW's equivalent function. The routing decision is **deterministic code, not an LLM judgment call**: `tools/capability_registry.py` builds `~/.bughunter/capabilities.json` (`NATIVE | RTW_AVAILABLE | RTW_MISSING_DEPS` per capability — a boot-time registry with pinned per-capability go-install and an ABH-style Req/Opt API-key banner), and `tools/rtw_adapter.py` runs a fixed six-step flow (typed ID → native guard → 7-day-TTL dedup against `~/.bughunter/recon/<host>/rtw_manifest.json` → availability → fail-closed scope gate → reconFTW's supported single-function interface with an ephemeral `rtw_override.cfg`). The 7 verified gap map: ASN/CIDR enum (`sub_asn`), DNS brute/permutation (`sub_permut`), CDN/origin isolation (`cdnprovider`), JS source-map/AST secrets (`jschecks`), virtual-host discovery (`virtualhosts`), TLS IP pivots (`tls_ip_pivots`), favicon fingerprinting (`favirecon_tech`). `modules/vulns.sh` is never delegated; every output file is scope-filtered post-call.
