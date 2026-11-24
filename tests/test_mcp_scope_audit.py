@@ -20,8 +20,14 @@ def _load_server():
     for p in (str(REPO_ROOT), str(MCP_DIR)):
         if p not in sys.path:
             sys.path.insert(0, p)
-    import server  # noqa: PLC0415
-    return server
+    # unique module name: other MCP tests import a *different* server.py
+    # (hackerone-mcp) under the plain "server" name — never reuse that cache
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "bughunter_mcp_server", MCP_DIR / "server.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def test_docs_mcp_documents_caller_supplied_scope():
