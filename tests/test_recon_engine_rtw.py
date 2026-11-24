@@ -16,6 +16,7 @@ checkout (no network, no real scanners needed):
 """
 
 import argparse
+import shutil
 import json
 import os
 import subprocess
@@ -587,3 +588,101 @@ with open(out_file, "w", encoding="utf-8") as out:
             srv_b.shutdown()
             srv_a.server_close()
             srv_b.server_close()
+
+
+class TestPostEnumerationScopeFilter:
+    """B3 regression: hosts/URLs discovered OUT of scope (stub subfinder /
+    katana / gau emit oos.evil.com) are filtered BEFORE any probing tool
+    reads them. Dropped lines land in scope/dropped_oos.txt, the dropped
+    count in the Summary and in recon_truth.json counts.scope_dropped. The
+    filter is a no-op with --no-scope-check and self-scopes local targets."""
+
+    @staticmethod
+    def _oos_stubbin(tmp_path):
+        stub = tmp_path / "oos-bin"
+        stub.mkdir(exist_ok=True)
+        subfinder = stub / "subfinder"
+        subfinder.write_text(
+            "#!/bin/bash\n"
+            'out=""\n'
+            'while [[ $# -gt 0 ]]; do case "$1" in -o) out="$2";; esac; shift; done\n'
+            '[[ -n "$out" ]] && printf "target.goodscope.example\\noos.evil.com\\n" > "$out"\n'
+            "exit 0\n")
+        subfinder.chmod(0o755)
+        katana = stub / "katana"
+        katana.write_text(
+            "#!/bin/bash\n"
+            'list=""; out=""\n'
+            'while [[ $# -gt 0 ]]; do case "$1" in -list) list="$2";; -o) out="$2";; esac; shift; done\n'
+            '{ while IFS= read -r u; do echo "http://$u/api"; done < "$list";\n'
+            '  echo "http://oos.evil.com/leak"; } > "$out"\n'
+            "exit 0\n")
+        katana.chmod(0o755)
+        gau = stub / "gau"
+        gau.write_text(
+            "#!/bin/bash\n"
+            'out=""\n'
+            'while [[ $# -gt 0 ]]; do case "$1" in --o) out="$2";; esac; shift; done\n'
+            'if [[ -n "$out" ]]; then echo "http://oos.evil.com/old-page" > "$out";\n'
+            'else echo "http://oos.evil.com/old-page"; fi\n'
+            "exit 0\n")
+        gau.chmod(0o755)
+        # httpx echoes every probed host, so an OOS host in its -l input
+        # would land in live/httpx_full.txt (the before-fix behavior).
+        httpx = stub / "httpx"
+        httpx.write_text(
+            "#!/bin/bash\n"
+            'if [[ "$1" == "-version" ]]; then echo "httpx 1.3.5 projectdiscovery"; exit 0; fi\n'
+            'out=""; list=""\n'
+            'while [[ $# -gt 0 ]]; do case "$1" in -o) out="$2";; -l) list="$2";; esac; shift; done\n'
+            '[[ -n "$out" && -n "$list" ]] || exit 0\n'
+            'while IFS= read -r h; do [[ -z "$h" ]] && continue;\n'
+            '  echo "$h [200] [Welcome] [nginx] [2048]"; done < "$list" > "$out"\n'
+            "exit 0\n")
+        httpx.chmod(0o755)
+        return stub
+
+    def test_oos_discoveries_filtered_before_probing(self, rtw_env, tmp_path):
+        stub = self._oos_stubbin(tmp_path)
+        for tool in ("subfinder", "katana", "gau", "httpx"):
+            shutil.copyfile(stub / tool, rtw_env["stub_bin"] / tool)
+            (rtw_env["stub_bin"] / tool).chmod(0o755)
+        proc = run_engine([TARGET, "--scope-domain", SCOPE[0]])
+        out = proc.stdout + proc.stderr
+        assert proc.returncode == 0, out[-3000:]
+        recon = rtw_env["recon_out"]
+        for rel in ("subdomains/all.txt", "urls/all.txt",
+                    "live/httpx_full.txt", "live/urls.txt"):
+            text = (recon / rel).read_text() if (recon / rel).exists() else ""
+            assert "oos.evil.com" not in text, f"OOS asset leaked into {rel}"
+        assert "target.goodscope.example" in \
+            (recon / "subdomains" / "all.txt").read_text()
+        dropped = recon / "scope" / "dropped_oos.txt"
+        assert dropped.is_file(), "dropped_oos.txt missing"
+        dropped_text = dropped.read_text()
+        assert "oos.evil.com" in dropped_text
+        truth = json.loads((recon / "recon_truth.json").read_text())
+        assert truth["counts"]["scope_dropped"] >= 3
+        assert "Scope-filtered (dropped OOS)" in out
+        # in-scope URL survived the URL-side filter
+        assert "http://target.goodscope.example/api" in \
+            (recon / "urls" / "all.txt").read_text()
+
+    def test_no_scope_check_filter_is_noop(self, rtw_env, tmp_path):
+        stub = self._oos_stubbin(tmp_path)
+        for tool in ("subfinder", "katana", "gau", "httpx"):
+            shutil.copyfile(stub / tool, rtw_env["stub_bin"] / tool)
+            (rtw_env["stub_bin"] / tool).chmod(0o755)
+        proc = run_engine([TARGET, "--no-scope-check"])
+        out = proc.stdout + proc.stderr
+        assert proc.returncode == 0, out[-3000:]
+        all_txt = (rtw_env["recon_out"] / "subdomains" / "all.txt").read_text()
+        assert "oos.evil.com" in all_txt, \
+            "--no-scope-check must leave the filter as a no-op"
+        assert not (rtw_env["recon_out"] / "scope" / "dropped_oos.txt").exists()
+
+    def test_local_target_self_scoping_kept(self, rtw_env, tmp_path):
+        """Local target without patterns: the filter self-scopes to the
+        target itself and keeps the target's host:port probe entry."""
+        proc = run_engine(["127.0.0.1:8080", "--no-scope-check"])
+        assert proc.returncode == 0, (proc.stdout + proc.stderr)[-2000:]

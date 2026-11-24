@@ -145,6 +145,57 @@ _rtw_run_phase() {
         ${RTW_SCOPE_ARGS[@]+"${RTW_SCOPE_ARGS[@]}"}
 }
 
+# ── B3: post-enumeration scope filter ────────────────────────────────────
+# Hosts/URLs discovered by subfinder/crt.sh/wayback/katana/gau or the
+# reconFTW gap-fill are filtered through the SAME ScopeChecker rules as the
+# pre-flight gate BEFORE any probing tool reads them. Dropped lines are
+# written to <recon_dir>/scope/dropped_oos.txt (prefixed with their source
+# file); the dropped total lands in the Recon Summary and in recon_truth.json
+# (counts.scope_dropped). No-op when --no-scope-check is passed; patternless
+# targets self-scope to the target itself (ip/local/cidr); list targets are
+# pre-resolved scope lists, so they are left untouched.
+SCOPE_DROPPED_TOTAL=0
+_abh_scope_filter() {
+    [ "$SCOPE_OPT_OUT" = "1" ] && return 0
+    local _f="$1"
+    [ -f "$_f" ] || return 0
+    [ -s "$_f" ] || return 0
+    local _filter_args=()
+    if [ ${#SCOPE_DOMAIN_ARGS[@]} -gt 0 ]; then
+        _filter_args=("${SC_CHECK_ARGS[@]}")
+    else
+        case "$(printf '%s' "${TARGET_TYPE:-}" | tr -d '[:space:]')" in
+            ip|local|cidr) _filter_args=(--domain "$TARGET") ;;
+            *) return 0 ;;
+        esac
+    fi
+    mkdir -p "$RECON_DIR/scope"
+    local _rel="${_f#$RECON_DIR/}"
+    local _tmp_in="$RECON_DIR/scope/.filter_in.txt"
+    local _tmp_drop="$RECON_DIR/scope/.filter_dropped.txt"
+    cp "$_f" "$_tmp_in" 2>/dev/null || return 0
+    if python3 "$BASE_DIR/tools/scope_checker.py" \
+            ${_filter_args[@]+"${_filter_args[@]}"} \
+            --input-file "$_tmp_in" --output "$_f" \
+            --dropped-file "$_tmp_drop" >/dev/null 2>&1; then
+        if [ -s "$_tmp_drop" ]; then
+            local _n
+            _n=$(grep -c . "$_tmp_drop" 2>/dev/null || echo 0)
+            while IFS= read -r _oos_line; do
+                [ -z "$_oos_line" ] && continue
+                printf '%s\t%s\n' "$_rel" "$_oos_line" >> "$RECON_DIR/scope/dropped_oos.txt"
+            done < "$_tmp_drop"
+            SCOPE_DROPPED_TOTAL=$((SCOPE_DROPPED_TOTAL + _n))
+            log_info "Scope filter: dropped $_n out-of-scope line(s) from $_rel (scope/dropped_oos.txt)"
+        fi
+    else
+        # The checker itself failed — never silently probe unfiltered data.
+        cp "$_tmp_in" "$_f" 2>/dev/null || true
+        log_warn "Scope filter FAILED for $_rel — file left UNFILTERED (checker error); investigate python3 tools/scope_checker.py"
+    fi
+    rm -f "$_tmp_in" "$_tmp_drop"
+}
+
 # Auth-aware hunting: load BBHUNT_AUTH_HEADERS / BBHUNT_SESSION_ID into
 # BB_AUTH_ARGS=(-H 'Name: val' ...). Empty session = no-op.
 # shellcheck source=tools/_auth_helper.sh
@@ -545,6 +596,9 @@ log_ok "Seed host included; probe list now: $TOTAL_SUBS host(s)"
 
 fi  # end of domain-only subdomain enum block
 
+# B3 filter point 1/4: after the Phase 1 merge, BEFORE httpx reads all.txt.
+_abh_scope_filter "$RECON_DIR/subdomains/all.txt"
+
 # ============================================================
 # Phase 1.5: reconFTW Subdomain/Infra Gap-Fill (RhodawkAI Edition)
 # ASN/CIDR enum, DNS permutation, CDN/origin isolation — delegated to
@@ -579,6 +633,10 @@ if _rtw_ready; then
 else
     log_step "reconFTW gap-fill not configured (RTW_HOME unset) — skipping (upstream behavior)"
 fi
+
+# B3 filter point 2/4: after the Phase 1.5 merge (gap-fill output was already
+# post-call filtered by the adapter; this re-checks the merged probe list).
+_abh_scope_filter "$RECON_DIR/subdomains/all.txt"
 
 # ============================================================
 # Phase 2: HTTP Probing
@@ -861,6 +919,9 @@ fi
 cat "$RECON_DIR/urls/"*.txt 2>/dev/null | sort -u > "$RECON_DIR/urls/all.txt" 2>/dev/null || true
 log_done "Total unique URLs: $(wc -l < "$RECON_DIR/urls/all.txt" 2>/dev/null || echo 0)"
 
+# B3 filter point 3/4: after the Phase 4 URL collection merge (gau/katana).
+_abh_scope_filter "$RECON_DIR/urls/all.txt"
+
 # Filter interesting URLs
 if [ -s "$RECON_DIR/urls/all.txt" ]; then
     # URLs with parameters (potential injection points)
@@ -945,6 +1006,10 @@ if _rtw_ready; then
 else
     log_step "reconFTW gap-fill not configured (RTW_HOME unset) — skipping (upstream behavior)"
 fi
+
+# B3 filter point 4/4: after the Phase 5.5 merge (before Phase 6 fuzzing and
+# the Summary read the URL corpus).
+_abh_scope_filter "$RECON_DIR/urls/all.txt"
 
 # ============================================================
 # Phase 6: Directory Fuzzing
@@ -1267,6 +1332,7 @@ done
 echo "  Probe list (post gap-fill): $(wc -l < "$RECON_DIR/subdomains/all.txt" | tr -d ' ') subdomains"
 [ -f "$RECON_DIR/urls/all.txt" ] && \
 echo "  URL corpus (post gap-fill): $(wc -l < "$RECON_DIR/urls/all.txt" | tr -d ' ') urls"
+echo "  Scope-filtered (dropped OOS): $SCOPE_DROPPED_TOTAL line(s) (scope/dropped_oos.txt)"
 
 # Step 2C: 1-line run-over-run delta summary.
 if [ -f "$RECON_DIR/delta.json" ]; then

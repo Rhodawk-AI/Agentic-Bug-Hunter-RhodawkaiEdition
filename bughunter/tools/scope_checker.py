@@ -470,12 +470,15 @@ class ScopeChecker:
                 out_of_scope.append(url)
         return in_scope, out_of_scope
 
-    def filter_file(self, input_path: str, output_path: str | None = None) -> tuple[int, int]:
+    def filter_file(self, input_path: str, output_path: str | None = None,
+                    dropped_path: str | None = None) -> tuple[int, int]:
         """Filter a file of URLs (one per line) through scope check.
 
         Args:
             input_path: Path to file with URLs, one per line.
             output_path: If provided, write in-scope URLs here. If None, filter in-place.
+            dropped_path: If provided, write the out-of-scope lines here (one per
+                line) so callers can quarantine them (B3 post-enumeration filter).
 
         Returns:
             (in_scope_count, out_of_scope_count)
@@ -489,6 +492,14 @@ class ScopeChecker:
         with open(dest, "w") as f:
             for url in in_scope:
                 f.write(url + "\n")
+
+        if dropped_path and out_of_scope:
+            try:
+                with open(dropped_path, "w") as df:
+                    for url in out_of_scope:
+                        df.write(url + "\n")
+            except OSError:
+                pass
 
         if out_of_scope:
             print(
@@ -538,6 +549,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--vuln-class", help="Optional vulnerability class to check")
     parser.add_argument("--input-file", help="Filter URLs from a file, one per line")
     parser.add_argument("--output", help="Output path for filtered in-scope URLs")
+    parser.add_argument("--dropped-file", help="Write the dropped out-of-scope lines "
+                                               "here (used by the recon_engine.sh "
+                                               "post-enumeration scope filter)")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     parser.add_argument("--explain", action="store_true", help="Print the matched rule + reason")
     args = parser.parse_args(argv)
@@ -582,7 +596,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.input_file:
         try:
-            in_count, out_count = checker.filter_file(args.input_file, args.output)
+            in_count, out_count = checker.filter_file(args.input_file, args.output,
+                                                      dropped_path=args.dropped_file)
         except OSError as exc:
             parser.error(str(exc))
         result["input_file"] = args.input_file

@@ -635,6 +635,9 @@ def build_truth(recon_dir: Path, target: str,
 
     origin_ips = {ip for h in hosts if h["asset_class"] == CLASS_ORIGIN
                   for ip in h["ips"] if ip}
+    # B3: every line the post-enumeration scope filter dropped is quarantined
+    # in scope/dropped_oos.txt ("<relpath>\t<line>"); surface the count.
+    scope_dropped = len(_read_lines(recon_dir / "scope" / "dropped_oos.txt"))
     counts = {
         "subdomains": len(subdomains),
         "live_hosts": len(hosts),
@@ -645,6 +648,7 @@ def build_truth(recon_dir: Path, target: str,
         "open_ports": len(port_rows),
         "unique_urls": len(url_rows),
         "js_endpoints": len(js_rows),
+        "scope_dropped": scope_dropped,
     }
     return {
         "schema_version": SCHEMA_VERSION,
