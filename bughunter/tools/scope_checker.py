@@ -363,6 +363,32 @@ class ScopeChecker:
         self.excluded_domains = [d.lower() for d in (excluded_domains or [])]
         self.excluded_classes = [c.lower() for c in (excluded_classes or [])]
 
+        # UX: a :port or /path constraint can never match the HOST-level
+        # checks this checker is used for (the pre-flight gate, the adapter's
+        # target check, and bare-host/URL filtering all evaluate default-port
+        # bare hosts). The rule is retained (a URL with the exact port/path
+        # still matches), but every host-level check fails closed against it,
+        # which previously happened SILENTLY. Warn at construction, naming
+        # the pattern and the reason, so a misconfigured scope surfaces
+        # immediately instead of "everything got dropped and nothing said why".
+        for rule in self._allow_domain_rules:
+            if rule.get("port") is not None or rule.get("path"):
+                _warn(
+                    f"allow pattern {rule['raw']!r} carries a :port or /path "
+                    "constraint — host-level checks (pre-flight gate, adapter "
+                    "target check, bare-host filtering) can never match it, so "
+                    "it acts as IGNORED and fails closed; add an unconstrained "
+                    "pattern (e.g. the bare host or *.base) for enumeration runs"
+                )
+        for rule in self._exclude_domain_rules:
+            if rule.get("port") is not None or rule.get("path"):
+                _warn(
+                    f"exclusion pattern {rule['raw']!r} carries a :port or "
+                    "/path constraint — host-level exclusion matching ignores "
+                    "port/path, so the exclusion effectively applies to the "
+                    "host on ALL ports and paths (broader than written)"
+                )
+
     def explain(self, url: str) -> dict:
         """Deterministic scope decision with attribution.
 
