@@ -108,6 +108,37 @@ PY
     return 1
 }
 
+# ── h1scope — HackerOne scope sync (Commit 1) ──────────────────────────────────
+# Git-sourced uv/pipx tool (no PyPI release), with a pipx fallback when uv is
+# unavailable. Non-fatal on failure — scoped H1 pulls degrade to keyless mode.
+install_h1scope() {
+    if command -v h1scope &>/dev/null; then
+        log_ok "h1scope already installed ($(command -v h1scope))"
+        return 0
+    fi
+    local src="git+https://github.com/AegisTrail/h1scope"
+    if command -v uv &>/dev/null && uv tool install "$src" 2>/dev/null; then
+        log_ok "h1scope installed via uv"
+        return 0
+    fi
+    if ! command -v pipx &>/dev/null; then
+        if command -v brew &>/dev/null; then
+            echo "    Installing pipx via brew (h1scope fallback)..."
+            brew install pipx >/dev/null 2>&1 || true
+        elif command -v python3 &>/dev/null; then
+            python3 -m pip install --user pipx >/dev/null 2>&1 || true
+        fi
+    fi
+    if command -v pipx &>/dev/null && pipx install "$src" 2>/dev/null; then
+        log_ok "h1scope installed via pipx"
+        return 0
+    fi
+    log_warn "h1scope failed to install — try manually:"
+    log_warn "  uv tool install $src"
+    log_warn "  pipx install $src"
+    return 0
+}
+
 if [ "$INSTALL_BROWSER" = "true" ]; then
     install_managed_browser || exit 1
     exit 0
@@ -236,6 +267,23 @@ for i in "${!GO_TOOLS[@]}"; do
         fi
     fi
 done
+
+# dnsx — projectdiscovery DNS resolution (Commit 1; @latest per spec, unlike
+# the pinned GO_TOOLS above — dnsx moves fast and has no stable pin here).
+if command -v dnsx &>/dev/null; then
+    log_ok "dnsx already installed ($(command -v dnsx))"
+else
+    echo "    Installing dnsx..."
+    if go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest 2>/dev/null; then
+        log_ok "dnsx installed successfully"
+    else
+        log_err "dnsx failed to install — run manually:"
+        log_err "  go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
+    fi
+fi
+
+# h1scope — HackerOne scope sync (uv, pipx fallback)
+install_h1scope
 
 # sisakulint — GitHub Actions SAST (binary download)
 echo ""
@@ -524,7 +572,7 @@ echo "============================================="
 echo "[*] Installation Verification"
 echo "============================================="
 
-ALL_TOOLS=(subfinder httpx nuclei ffuf nmap amass gau dalfox subjack sisakulint)
+ALL_TOOLS=(subfinder httpx nuclei ffuf nmap amass gau dalfox subjack sisakulint dnsx h1scope)
 if [ "$INSTALL_CREDENTIAL_ATTACK" = true ]; then
     ALL_TOOLS+=(hashcat theHarvester cewler cupp trevorspray kerbrute)
 fi

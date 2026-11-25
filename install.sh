@@ -6,6 +6,7 @@ set -euo pipefail
 AGENT="${BBHUNT_AGENT:-claude}"
 SCOPE="global"
 SETUP_BURP="ask"
+NONINTERACTIVE=0
 
 # Every source path below is repo-relative, so anchor to the script's own
 # directory. Without this, running `~/tools/Agentic-Bug-Hunter/install.sh`
@@ -60,6 +61,8 @@ Examples:
                                   Install into .opencode/ for this repo
 
 Options:
+  --non-interactive               CI-safe mode: skip ALL prompts (Burp MCP +
+                                  the end-of-install credential wizard)
   --no-burp                       Skip Claude Code Burp MCP setup prompt
   --yes-burp                      Print Claude Code Burp MCP setup instructions
 EOF
@@ -88,6 +91,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --yes-burp)
             SETUP_BURP="yes"
+            ;;
+        --non-interactive)
+            NONINTERACTIVE=1
+            SETUP_BURP="no"
             ;;
         -h|--help)
             usage
@@ -561,3 +568,24 @@ PY
     echo "[i] Install the gap-fill backing binaries with: bash install_tools.sh --rtw-deps"
 }
 install_rtw_capability_delegation
+
+# ── Multi-platform credential bootstrap (Commit 1) ────────────────────────────
+# At the end of ./install.sh, new users configure every supported
+# platform/tool credential (HackerOne, Bugcrowd, Intigriti, YesWeHack, PDCP,
+# Chaos, LLM keys) right at bootstrap. The wizard writes ~/.bughunter/.env
+# (chmod 600, dir 700); skipped fields are saved blank so the file can be
+# edited later. Skipped when --non-interactive is passed, when stdin is not a
+# TTY (CI / piped installs), or when the module is missing —
+# `python3 bughunter/tools/credentials.py --setup` can be run at any time.
+if [ "$NONINTERACTIVE" != "1" ] && [ -t 0 ] && command -v python3 >/dev/null 2>&1 \
+   && [ -f "$SCRIPT_DIR/bughunter/tools/credentials.py" ]; then
+    echo ""
+    echo "─────────────────────────────────────────────"
+    echo "  Credential bootstrap (platform API keys)"
+    echo "─────────────────────────────────────────────"
+    echo "  Writes ~/.bughunter/.env (chmod 600). Press Enter to skip a field;"
+    echo "  skipped keys are stored blank for later editing."
+    echo ""
+    python3 "$SCRIPT_DIR/bughunter/tools/credentials.py" --setup \
+        || echo "[!] credential bootstrap failed — run manually: python3 bughunter/tools/credentials.py --setup"
+fi

@@ -277,6 +277,32 @@ def cmd_setup(args):
     """Interactive setup wizard."""
     header("BugHunter Setup")
 
+    # ── Multi-platform credential bootstrap (Commit 1) ─────────────────────
+    # Configure every supported platform/tool credential (HackerOne,
+    # Bugcrowd, Intigriti, YesWeHack, PDCP, Chaos, LLM keys) before the
+    # provider wizard, so recon + platform tools leave setup fully wired.
+    # Skipped on non-TTY stdin (CI / piped runs) — run
+    # `python3 bughunter/tools/credentials.py --setup` instead.
+    _run_onboarding = None
+    try:
+        sys.path.insert(0, str(HERE))
+        from tools.credentials import run_interactive_onboarding as _run_onboarding  # noqa: PLC0415
+    except ImportError:
+        try:
+            from credentials import run_interactive_onboarding as _run_onboarding  # noqa: PLC0415
+        except ImportError:
+            _run_onboarding = None
+    if _run_onboarding is not None:
+        if sys.stdin.isatty():
+            try:
+                _run_onboarding()
+            except Exception as exc:
+                warn(f"credential bootstrap failed: {exc}")
+            print()
+        else:
+            info("Skipping interactive credential bootstrap (no TTY) — run later:")
+            info("  python3 bughunter/tools/credentials.py --setup")
+
     providers = {
         "1":  ("ollama",     "Ollama     (local, FREE)       — needs ollama running locally"),
         "2":  ("groq",       "Groq       (cloud, FREE tier)  — needs GROQ_API_KEY"),
@@ -1058,6 +1084,34 @@ def cmd_doctor(args):
         else:
             record("WARN", var, f"unset — {purpose} disabled (optional)",
                    f"export {var}=...")
+
+    # 4b. Tool-to-credential vault status (Commit 1): READY / SKIPPED (blank)
+    # / KEYLESS for HackerOne, Bugcrowd, Intigriti, YesWeHack, PDCP, Chaos,
+    # the LLM keys, and the keyless tools (h1scope, bounty-targets-data).
+    _status_rows = None
+    try:
+        from tools.credentials import status_rows as _status_rows  # noqa: PLC0415
+    except ImportError:
+        try:
+            from credentials import status_rows as _status_rows  # noqa: PLC0415
+        except ImportError:
+            _status_rows = None
+    if _status_rows is None:
+        record("WARN", "Credential vault", "module missing (bughunter/tools/credentials.py)",
+               "git pull — bughunter/tools/credentials.py")
+    else:
+        try:
+            _cred_rows = _status_rows()
+        except Exception as exc:
+            _cred_rows = None
+            record("WARN", "Credential vault", f"status failed: {exc}",
+                   "python3 bughunter/tools/credentials.py --verify")
+        for _label, _status, _detail in (_cred_rows or []):
+            record("PASS" if _status in ("READY", "KEYLESS") else "WARN",
+                   _label, f"{_status}: {_detail}",
+                   "python3 bughunter/tools/credentials.py --setup"
+                   if _status not in ("READY", "KEYLESS") else "")
+
     cfg = load_config()
     provider = (os.environ.get("BRAIN_PROVIDER") or cfg.get("provider") or "")
     if not provider:
@@ -1280,6 +1334,29 @@ def main():
         os.environ["BRAIN_PROVIDER"] = provider_override
     if model_override:
         os.environ["BRAIN_MODEL"] = model_override
+
+    # ── Multi-platform credential vault (Commit 1) ─────────────────────────
+    # Every subcommand gets the 4-tier credential loader (env ->
+    # $BUGHUNTER_CREDENTIALS_FILE -> ~/.bughunter/.env -> /root/.secrets/h1_api)
+    # applied first, so platform tools (bbscope, HuntDeck, h1-brain, PDCP/
+    # Chaos-backed recon) and LLM providers all see the same credentials.
+    # Non-interactive here by design: the wizard runs via `bughunter setup`
+    # or `python3 bughunter/tools/credentials.py --setup`. Blank KEY=""
+    # entries are ignored, and file permissions are auto-tightened (dir 0700,
+    # file 0600). A vault failure must never kill the CLI.
+    try:
+        sys.path.insert(0, str(HERE))
+        from tools.credentials import load_credentials  # noqa: PLC0415
+    except ImportError:
+        try:
+            from credentials import load_credentials  # noqa: PLC0415
+        except ImportError:
+            load_credentials = None
+    if load_credentials is not None:
+        try:
+            load_credentials(interactive=False)
+        except Exception as exc:
+            warn(f"credential vault load failed: {exc}")
 
     # Load saved API keys into environment before any LLM call
     cfg = load_config()
