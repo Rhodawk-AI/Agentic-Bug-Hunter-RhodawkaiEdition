@@ -51,6 +51,10 @@ Full pipeline: Recon -> Learn -> Hunt -> Validate -> Report. One skill for every
 17. **T-SHAPED KNOWLEDGE** -- go DEEP in one area and BROAD across everything else
 18. **LEAD BOARD — never lose a lead** -- after recon run `python3 bughunter/tools/lead_board.py ingest <target>` + `show` + `next`. Route each signal to its skill ("GraphQL → hunt-graphql"). `touch` when starting/killing/reporting. Focus on one lead; the board remembers the rest. Surface stale high-priority leads unprompted.
 
+## Root Authority (kernel prompt & scope manifest)
+
+`bughunter/prompts/kernel.md` is the root system prompt for every BugHunter runtime: deterministic stage order (Compile Scope -> Scoped Recon -> Prioritized Surface -> Hypothesis Hunt -> Clean-Room Verify -> Report), `<untrusted_target_data>` data-plane isolation, authorized-verification framing, and the typed-tools rule. This skill documents the same workflow — where wording drifts, `bughunter/prompts/kernel.md` and the SHA-256-verified `recon/<handle>/scope/compiled_scope.json` (`CompiledScopeManifest`, produced by `bughunter scope-compile <handle>` / `bughunter_compile_scope`) are the single source of truth. Scope is fail-closed end to end: `exit 3` in the recon engines, `SCOPE_REQUIRED` in MCP, `SCOPE_HOOK_BLOCK` in PreToolUse hooks.
+
 > **For the full hunting methodology** — 5-phase non-linear workflow, developer psychology framework, session discipline, tool routing by phase, and Wide/Deep route selection — see **`skills/bb-methodology/SKILL.md`**.
 >
 > **Tool catalogue:** `bughunter/tools/README.md` (~50 tools). Orchestrator: `python3 bughunter/tools/hunt.py --target T` (auto lead ingest; add `--graphql` / `--cve-hunt` as needed).
@@ -363,12 +367,19 @@ ffuf -u https://TARGET/api/FUZZ -w /usr/share/seclists/Discovery/Web-Content/api
 ```
 
 ## HackerOne Scope Retrieval
+
+**Authoritative workflow — compile a verified manifest; never hand-scrape scope:**
+
 ```bash
-curl -s "https://hackerone.com/graphql" \
-  -H "Content-Type: application/json" \
-  -d '{"query":"query { team(handle: \"PROGRAM_HANDLE\") { name url policy_scopes(archived: false) { edges { node { asset_type asset_identifier eligible_for_bounty instruction } } } } }"}' \
-  | jq '.data.team.policy_scopes.edges[].node'
+bughunter scope-compile PROGRAM_HANDLE
+# -> recon/<handle>/scope/compiled_scope.json  (typed, SHA-256 self-verifying)
+
+# Check any asset against the verified manifest:
+python3 bughunter/tools/scope_checker.py api.target.com \
+  --manifest recon/<handle>/scope/compiled_scope.json
 ```
+
+MCP equivalent: `bughunter_compile_scope(program_handle="...")`. The compiled manifest (allow/exclude patterns, excluded classes, mandatory headers, max RPS) is the single scope authority for recon, hunt and MCP. Raw `curl` GraphQL scraping is removed: it drifts from the program page and bypasses integrity verification. If `scope-compile` cannot authenticate (private program), fall back to `/scope-aggregate` and verify assets with the checker.
 
 ## Quick Wins Checklist
 - [ ] Subdomain takeover (`subjack`, `subzy`)
@@ -460,13 +471,14 @@ grep -rn "as u8\|as u16\|as u32\|as usize" --include="*.rs" | grep -v "checked\|
 # PHASE 2: LEARN (Pre-Hunt Intelligence)
 
 ## Read Disclosed Reports
-```bash
-# By program on HackerOne
-curl -s "https://hackerone.com/graphql" \
-  -H "Content-Type: application/json" \
-  -d '{"query":"{ hacktivity_items(first:25, order_by:{field:popular, direction:DESC}, where:{team:{handle:{_eq:\"PROGRAM\"}}}) { nodes { ... on HacktivityDocument { report { title severity_rating } } } } }"}' \
-  | jq '.data.hacktivity_items.nodes[].report'
+
+Use the hackerone MCP server tool — no raw GraphQL scraping:
+
+```text
+search_disclosed_reports(keyword="", program="PROGRAM", limit=25)
 ```
+
+Call it as a typed tool (args: `keyword`, `program`, `limit`). Feed the disclosed titles + severities into the "What Changed" method below.
 
 ## "What Changed" Method
 1. Find disclosed report for similar tech
