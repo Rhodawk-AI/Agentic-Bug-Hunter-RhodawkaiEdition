@@ -294,7 +294,7 @@ RhodawkAI Edition stands on the shoulders of open-source builders:
 
 🌐 **[rhodawkai.com](https://rhodawkai.com)** · 🐙 **[github.com/Rhodawk-AI](https://github.com/Rhodawk-AI)** · ✉️ **[manager@rhodawkai.com](mailto:manager@rhodawkai.com)**
 
-**Made with ♥ · Telegram [@rhodawk1](https://t.me/rhodawk1)**
+**Made with ♥ · Telegram [@rhodawk1](https://t.me/Indian_wizard)**
 
 <sub>MIT License · For authorized security testing only. Always test within an approved bug bounty program scope.</sub>
 
