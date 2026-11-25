@@ -24,7 +24,11 @@ TARGET="${1}"
 TARGETURL="https://${TARGET}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUT="recon/${TARGET}_${TIMESTAMP}"
-TOOLS_DIR="$(dirname $0)/.."
+# Commit 3 path fix: the shared tooling (_auth_helper.sh, banner.sh,
+# scope_checker.py) lives under <repo>/bughunter/tools/ — the legacy
+# "$(dirname $0)/.." pointed at the repo ROOT, where no tools/ directory
+# exists, so every `source` below silently failed under `set -e`.
+TOOLS_DIR="$(cd "$(dirname "$0")/.." && pwd)/bughunter"
 
 # Auth (optional)
 TOKEN=""
@@ -32,6 +36,15 @@ COOKIE=""
 QUICK=false
 RECON_ONLY=false
 SCAN_ONLY=false
+
+# Commit 3: mandatory scope pre-flight. The legacy pipeline used to launch
+# subfinder/crt.sh/amass against ANY target with zero scope validation —
+# full_hunt.sh now refuses unscoped runs (exit 3) unless --no-scope-check is
+# explicitly passed for local demo testing.
+SCOPE_DOMAIN_ARGS=()
+SCOPE_EXCLUDE_ARGS=()
+SCOPE_MANIFEST=""
+NO_SCOPE_CHECK=false
 
 # Wordlists (adjust paths to match your install)
 WL_DIRS="/opt/SecLists/Discovery/Web-Content/directory-list-2.3-medium.txt"
@@ -79,6 +92,16 @@ while [[ "$#" -gt 0 ]]; do
         --scan-only)   SCAN_ONLY=true ;;
         --token)       TOKEN="$2"; shift ;;
         --cookie)      COOKIE="$2"; shift ;;
+        --scope-domain)
+            [ "$#" -lt 2 ] && { err "--scope-domain requires a pattern"; exit 1; }
+            SCOPE_DOMAIN_ARGS+=("$2"); shift ;;
+        --scope-exclude)
+            [ "$#" -lt 2 ] && { err "--scope-exclude requires a pattern"; exit 1; }
+            SCOPE_EXCLUDE_ARGS+=("$2"); shift ;;
+        --scope-manifest)
+            [ "$#" -lt 2 ] && { err "--scope-manifest requires a path"; exit 1; }
+            SCOPE_MANIFEST="$2"; shift ;;
+        --no-scope-check) NO_SCOPE_CHECK=true ;;
         *) warn "Unknown option: $1" ;;
     esac
     shift
@@ -87,7 +110,58 @@ done
 # ── Validate ──────────────────────────────────────────────────────────────────
 if [ -z "$TARGET" ]; then
     echo "Usage: bash full_hunt.sh target.com [--quick] [--token JWT] [--cookie COOKIE]"
+    echo "                     [--scope-manifest PATH | --scope-domain PATTERN]... [--no-scope-check]"
     exit 1
+fi
+
+# ── Scope pre-flight gate (Commit 3 — fail-closed, 0 packets unscoped) ────────
+# Runs BEFORE any network activity (before subfinder/amass/crt.sh in Phase 1
+# and before the output dirs even exist). A run needs a verified compiled
+# scope manifest OR at least one --scope-domain pattern, validated through
+# the SAME deterministic ScopeChecker the engine uses; anything else exits 3
+# after an audit entry is appended.
+_abh_fullhunt_audit_block() {
+    local _hm="${BUGHUNTER_HOME:-$HOME/.bughunter}/hunt-memory"
+    mkdir -p "$_hm" 2>/dev/null || return 0
+    printf '{"ts":"%s","url":"https://%s","method":"GET","scope_check":"fail","error":"full_hunt.sh: %s","schema_version":1}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TARGET" "$1" >> "$_hm/audit.jsonl" 2>/dev/null || true
+}
+
+_FULLHUNT_SCOPE_ARGS=()
+if [ "$NO_SCOPE_CHECK" = true ]; then
+    warn "Scope gate: --no-scope-check opt-out — running UNSCOPED (demo/testing only)"
+elif [ -n "$SCOPE_MANIFEST" ]; then
+    if [ ! -f "$SCOPE_MANIFEST" ]; then
+        err "SCOPE BLOCK: --scope-manifest '$SCOPE_MANIFEST' not found (fail-closed)"
+        _abh_fullhunt_audit_block "manifest not found: $SCOPE_MANIFEST"
+        exit 3
+    fi
+    _FULLHUNT_SCOPE_ARGS=(--manifest "$SCOPE_MANIFEST")
+    if ! python3 "$TOOLS_DIR/tools/scope_checker.py" \
+            ${_FULLHUNT_SCOPE_ARGS[@]+"${_FULLHUNT_SCOPE_ARGS[@]}"} "$TARGET" >/dev/null 2>&1; then
+        err "SCOPE BLOCK: target '$TARGET' is outside the scope manifest or the manifest is tampered (SHA-256 verified, fail-closed)"
+        _abh_fullhunt_audit_block "target outside scope manifest: $SCOPE_MANIFEST"
+        exit 3
+    fi
+    ok "Scope gate: compiled manifest verified ($SCOPE_MANIFEST)"
+elif [ ${#SCOPE_DOMAIN_ARGS[@]} -eq 0 ]; then
+    err "SCOPE BLOCK: unscoped runs are refused — pass --scope-manifest PATH or --scope-domain PATTERN (repeatable), or --no-scope-check for local demo testing"
+    _abh_fullhunt_audit_block "no scope source provided (fail-closed pre-flight gate)"
+    exit 3
+else
+    for _p in "${SCOPE_EXCLUDE_ARGS[@]}"; do
+        _FULLHUNT_SCOPE_ARGS+=(--exclude-domain "$_p")
+    done
+    for _p in "${SCOPE_DOMAIN_ARGS[@]}"; do
+        _FULLHUNT_SCOPE_ARGS+=(--domain "$_p")
+    done
+    if ! python3 "$TOOLS_DIR/tools/scope_checker.py" \
+            ${_FULLHUNT_SCOPE_ARGS[@]+"${_FULLHUNT_SCOPE_ARGS[@]}"} "$TARGET" >/dev/null 2>&1; then
+        err "SCOPE BLOCK: target '$TARGET' is outside the provided scope patterns"
+        _abh_fullhunt_audit_block "target outside provided scope patterns"
+        exit 3
+    fi
+    ok "Scope gate: target validated against ${#SCOPE_DOMAIN_ARGS[@]} scope pattern(s)"
 fi
 
 # ── Create output dirs ────────────────────────────────────────────────────────

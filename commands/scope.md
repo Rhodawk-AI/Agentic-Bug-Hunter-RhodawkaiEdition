@@ -1,5 +1,5 @@
 ---
-description: Check if a target asset is in scope for the program before hunting or submitting. Reads program scope page, checks asset against in-scope and out-of-scope lists, verifies the asset is owned by the target organization. Usage: /scope <asset>
+description: Check if a target asset is in scope for the program before hunting or submitting. Authoritative source is the SHA-256-verified compiled scope manifest (bughunter scope-compile <handle> -> recon/<handle>/scope/compiled_scope.json), checked via scope_checker.py --manifest. Usage: /scope <asset>
 ---
 
 # /scope
@@ -22,27 +22,38 @@ Always check scope BEFORE the first request.
 /scope *.company.com
 ```
 
+## Authoritative Pre-Recon Workflow
+
+The single source of truth for program scope is the compiled, SHA-256-verified manifest — not a pasted scope list, not a scraped program page:
+
+```bash
+bughunter scope-compile <handle>
+# -> recon/<handle>/scope/compiled_scope.json   (typed CompiledScopeManifest)
+
+bughunter_compile_scope(program_handle="<handle>")   # MCP equivalent
+```
+
+Every scope check, recon run, hunt and MCP call verifies that manifest's hash fail-closed. The manifest wins over any prose in this file — see `bughunter/prompts/kernel.md` (root authority).
+
 ## Deterministic Local Check
 
-Use the local scope checker before sending traffic:
+Use the local scope checker against the verified manifest before sending traffic:
 
 ```bash
 python3 bughunter/tools/scope_checker.py https://api.target.com/v2/users \
-  --domain target.com \
-  --domain '*.target.com' \
-  --exclude-domain staging.target.com
+  --manifest recon/<handle>/scope/compiled_scope.json
 ```
 
 Filter a discovered URL list:
 
 ```bash
 python3 bughunter/tools/scope_checker.py \
-  --domain target.com \
-  --domain '*.target.com' \
-  --exclude-domain staging.target.com \
+  --manifest recon/<handle>/scope/compiled_scope.json \
   --input-file recon/target.com/urls/all.txt \
   --output recon/target.com/urls/in_scope.txt
 ```
+
+If no manifest exists yet, compile one first with `bughunter scope-compile <handle>`. The legacy `--domain '*.target.com'` pattern flags still work for quick sanity checks, but hand-typed patterns are not integrity-verified — prefer the manifest for anything that will drive traffic.
 
 ## Scope Check Process
 
@@ -62,21 +73,18 @@ Out-of-scope:
 - partners.target.com (third-party managed)
 ```
 
-### Step 2: Asset Ownership Check
+### Step 2: Asset Ownership & Third-Party Check (manifest-driven)
 
-Verify the asset is actually owned by the target company (not a third party):
+Ownership and third-party isolation are compiled into the verified manifest — do not re-derive them with raw `whois`/`dig` shell one-liners:
 
 ```bash
-# WHOIS
-whois api.target.com | grep -iE "registrant|admin|tech|org"
-
-# DNS — is it CNAME to a third party?
-dig +short api.target.com CNAME
-# If CNAME to salesforce.com, zendesk.com, etc. → not in scope
-
-# Check if it's a known third-party service:
-# intercom.io, freshdesk.com, zendesk.com, hubspot.com, etc.
+python3 bughunter/tools/scope_checker.py api.target.com \
+  --manifest recon/<handle>/scope/compiled_scope.json --explain
 ```
+
+- `excluded_classes` in the manifest carries the program's own exclusions; the checker reports which rule matched.
+- Third-party SaaS CNAME aliases (zendesk, statuspage, freshdesk, workday, greenhouse, lever, salesforce, shopify, github.io, marketo) are detected and isolated automatically by `recon_engine.sh`'s pre-probe CNAME gate before any HTTP traffic — a `*.target.com` wildcard that CNAMEs to Zendesk lands in `scope/dropped_oos.txt`, not in the probe set.
+- If ownership is genuinely ambiguous, compile the owning program (`bughunter scope-compile <handle>`) and compare manifests — the verified manifest is the authority, not ad-hoc WHOIS output.
 
 ### Step 3: Wildcard Interpretation
 

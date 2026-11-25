@@ -38,6 +38,7 @@ import argparse
 import ipaddress
 import json
 import re
+from pathlib import Path
 from urllib.parse import urlparse, urlsplit
 
 
@@ -321,6 +322,53 @@ def extract_host_port(url: str) -> str:
 class ScopeChecker:
     """Deterministic scope validator for bug bounty targets."""
 
+    @classmethod
+    def from_manifest(cls, manifest_path_or_obj) -> "ScopeChecker":
+        """Build a checker from a typed CompiledScopeManifest (Commit 3 wiring).
+
+        Accepts either a filesystem path to a compiled manifest or an already
+        constructed ``CompiledScopeManifest`` object. The manifest is loaded
+        with ``require_valid_hash=True`` — a tampered file raises ``ValueError``
+        (fail closed, never silently widened). The resulting checker enforces
+        the manifest's allow_patterns / exclude_patterns / excluded_classes
+        verbatim; the source manifest is attached as ``.manifest`` (with its
+        ``manifest_sha256`` also exposed) so callers can audit which scope
+        artifact authorized a run.
+        """
+        try:  # package import (pythonpath=bughunter, or engine-style sys.path)
+            from contracts.scope import CompiledScopeManifest
+        except ImportError:  # standalone execution: python3 tools/scope_checker.py
+            _HERE = Path(__file__).resolve().parent
+            sys.path.insert(0, str(_HERE.parent))
+            from contracts.scope import CompiledScopeManifest
+
+        # Duck-type the manifest object: this module is reachable BOTH as
+        # tools.scope_checker (pythonpath=bughunter) and as
+        # bughunter.tools.scope_checker (package import), and contracts.scope
+        # is likewise importable under two names — isinstance() across those
+        # two module objects is always False. A real manifest is identified
+        # by its contract surface instead, which is import-path agnostic.
+        if hasattr(manifest_path_or_obj, "allow_patterns") and \
+                hasattr(manifest_path_or_obj, "verify_integrity"):
+            manifest = manifest_path_or_obj
+            if not manifest.verify_integrity():
+                raise ValueError(
+                    "scope manifest integrity check FAILED — "
+                    "manifest_sha256 does not match contents (tampered?)"
+                )
+        else:
+            manifest = CompiledScopeManifest.load(
+                str(manifest_path_or_obj), require_valid_hash=True)
+
+        checker = cls(
+            domains=list(manifest.allow_patterns),
+            excluded_domains=list(manifest.exclude_patterns),
+            excluded_classes=list(manifest.excluded_classes),
+        )
+        checker.manifest = manifest
+        checker.manifest_sha256 = manifest.manifest_sha256
+        return checker
+
     def __init__(
         self,
         domains: list[str],
@@ -553,6 +601,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("asset", nargs="?", help="URL or hostname to check")
     parser.add_argument(
+        "--manifest",
+        default=None,
+        help="Path to a compiled_scope.json manifest (Commit 2 artifact). "
+             "Allow/exclude patterns and excluded classes are taken from the "
+             "manifest (SHA-256 verified; tampered manifests fail with exit 3) "
+             "instead of --domain/--exclude-domain flags.",
+    )
+    parser.add_argument(
         "--domain",
         "-d",
         action="append",
@@ -586,21 +642,48 @@ def main(argv: list[str] | None = None) -> int:
     excluded_domains = _split_patterns(args.exclude_domain)
     excluded_classes = _split_patterns(args.exclude_class)
 
-    if not domains:
-        parser.error("at least one --domain pattern is required")
-    if not args.asset and not args.input_file and not args.vuln_class:
-        parser.error("provide an asset, --input-file, or --vuln-class")
+    # Manifest mode: allow/exclude/classes come from the typed contract. When
+    # --domain patterns are ALSO passed alongside --manifest, the manifest wins
+    # and the extra patterns are ignored (loudly) — mixing authorities could
+    # only widen scope, never narrow it, and this checker must fail closed.
+    if args.manifest:
+        if domains or excluded_domains:
+            _warn(
+                "--domain/--exclude-domain patterns are IGNORED when --manifest "
+                "is given (the verified manifest is the single authority)"
+            )
+        try:
+            checker = ScopeChecker.from_manifest(args.manifest)
+        except (ValueError, OSError) as exc:
+            # Fail closed: tampered hash, unreadable/missing file, or a
+            # ScopeError from a dangerous pattern inside the manifest.
+            # Exit 3 = SCOPE BLOCK (recon_engine.sh treats any non-zero
+            # exit from the checker as a hard block; 3 keeps it explicit).
+            print(f"SCOPE BLOCK: manifest unusable: {exc}", file=sys.stderr)
+            return 3
+        domains = list(checker.domains)
+        excluded_domains = list(checker.excluded_domains)
+        excluded_classes = list(checker.excluded_classes)
+    else:
+        if not domains:
+            parser.error("at least one --domain pattern is required")
+        try:
+            checker = ScopeChecker(domains, excluded_domains, excluded_classes)
+        except ScopeError as exc:
+            parser.error(str(exc))
 
-    try:
-        checker = ScopeChecker(domains, excluded_domains, excluded_classes)
-    except ScopeError as exc:
-        parser.error(str(exc))
+    if not args.asset and not args.input_file and not args.vuln_class \
+            and not args.manifest:
+        parser.error("provide an asset, --input-file, or --vuln-class")
 
     result: dict[str, object] = {
         "domains": domains,
         "excluded_domains": excluded_domains,
         "excluded_classes": excluded_classes,
     }
+    if args.manifest:
+        result["manifest"] = args.manifest
+        result["manifest_sha256"] = checker.manifest_sha256
     exit_code = 0
 
     if args.asset:

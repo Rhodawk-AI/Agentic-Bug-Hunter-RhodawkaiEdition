@@ -277,6 +277,32 @@ def cmd_setup(args):
     """Interactive setup wizard."""
     header("BugHunter Setup")
 
+    # ── Multi-platform credential bootstrap (Commit 1) ─────────────────────
+    # Configure every supported platform/tool credential (HackerOne,
+    # Bugcrowd, Intigriti, YesWeHack, PDCP, Chaos, LLM keys) before the
+    # provider wizard, so recon + platform tools leave setup fully wired.
+    # Skipped on non-TTY stdin (CI / piped runs) — run
+    # `python3 bughunter/tools/credentials.py --setup` instead.
+    _run_onboarding = None
+    try:
+        sys.path.insert(0, str(HERE))
+        from tools.credentials import run_interactive_onboarding as _run_onboarding  # noqa: PLC0415
+    except ImportError:
+        try:
+            from credentials import run_interactive_onboarding as _run_onboarding  # noqa: PLC0415
+        except ImportError:
+            _run_onboarding = None
+    if _run_onboarding is not None:
+        if sys.stdin.isatty():
+            try:
+                _run_onboarding()
+            except Exception as exc:
+                warn(f"credential bootstrap failed: {exc}")
+            print()
+        else:
+            info("Skipping interactive credential bootstrap (no TTY) — run later:")
+            info("  python3 bughunter/tools/credentials.py --setup")
+
     providers = {
         "1":  ("ollama",     "Ollama     (local, FREE)       — needs ollama running locally"),
         "2":  ("groq",       "Groq       (cloud, FREE tier)  — needs GROQ_API_KEY"),
@@ -1058,6 +1084,34 @@ def cmd_doctor(args):
         else:
             record("WARN", var, f"unset — {purpose} disabled (optional)",
                    f"export {var}=...")
+
+    # 4b. Tool-to-credential vault status (Commit 1): READY / SKIPPED (blank)
+    # / KEYLESS for HackerOne, Bugcrowd, Intigriti, YesWeHack, PDCP, Chaos,
+    # the LLM keys, and the keyless tools (h1scope, bounty-targets-data).
+    _status_rows = None
+    try:
+        from tools.credentials import status_rows as _status_rows  # noqa: PLC0415
+    except ImportError:
+        try:
+            from credentials import status_rows as _status_rows  # noqa: PLC0415
+        except ImportError:
+            _status_rows = None
+    if _status_rows is None:
+        record("WARN", "Credential vault", "module missing (bughunter/tools/credentials.py)",
+               "git pull — bughunter/tools/credentials.py")
+    else:
+        try:
+            _cred_rows = _status_rows()
+        except Exception as exc:
+            _cred_rows = None
+            record("WARN", "Credential vault", f"status failed: {exc}",
+                   "python3 bughunter/tools/credentials.py --verify")
+        for _label, _status, _detail in (_cred_rows or []):
+            record("PASS" if _status in ("READY", "KEYLESS") else "WARN",
+                   _label, f"{_status}: {_detail}",
+                   "python3 bughunter/tools/credentials.py --setup"
+                   if _status not in ("READY", "KEYLESS") else "")
+
     cfg = load_config()
     provider = (os.environ.get("BRAIN_PROVIDER") or cfg.get("provider") or "")
     if not provider:
@@ -1128,6 +1182,71 @@ def cmd_mcp(args):
     from cli import main as mcp_main  # type: ignore
     sub = getattr(args, "mcp_command", "serve") or "serve"
     raise SystemExit(mcp_main([sub]))
+
+
+def cmd_scope_compile(args):
+    """Compile a program's scope into a typed, hashed manifest (Commit 2).
+
+    Delegates to tools/scope_compiler.py: authenticated paginated H1 REST
+    when the credential vault has HackerOne credentials, cursor-paginated
+    public GraphQL (then bounty-targets-data) when keyless. Zero secret
+    leakage — output carries counts, headers, RPS and paths only.
+    """
+    try:
+        sys.path.insert(0, str(HERE))
+        from tools import scope_compiler
+    except ImportError:
+        try:
+            import scope_compiler  # type: ignore
+        except ImportError:
+            err("scope_compiler not found — expected bughunter/tools/scope_compiler.py")
+            sys.exit(1)
+
+    try:
+        handle = scope_compiler.normalize_handle(args.handle)
+    except ValueError as exc:
+        err(f"invalid program handle: {exc}")
+        sys.exit(2)
+
+    # Default output lives beside the recon dir for this program, so
+    # 'bughunter scope-compile X' + 'bughunter recon ...' read the same tree.
+    output = args.output or str(RECON / handle / "scope" / "compiled_scope.json")
+
+    info(f"Compiling scope for '{handle}'...")
+    try:
+        summary = scope_compiler.compile_and_save(
+            args.handle,
+            output=output,
+            h1scope_csv=args.h1scope_csv or None,
+            huntdeck_db=args.huntdeck_db or None,
+            bbscope_cache=args.bbscope_cache or None,
+        )
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 — surface a clean CLI error
+        err(f"scope compile failed: {exc}")
+        sys.exit(2)
+
+    header(f"Scope manifest: {summary['program_handle']} "
+           f"({summary['auth_mode']})")
+    ok(f"allow patterns: {summary['allow_patterns']}")
+    ok(f"exclude patterns: {summary['exclude_patterns']}")
+    if summary.get("excluded_classes"):
+        info(f"excluded classes: {', '.join(summary['excluded_classes'])}")
+    if summary.get("mandatory_headers"):
+        info("mandatory headers: "
+             + ", ".join(f"{k}: {v}".strip(": ")
+                         for k, v in summary["mandatory_headers"].items()))
+    info(f"max RPS: {summary['max_rps']}")
+    info(f"sources: {'; '.join(summary['sources'])}")
+    if summary.get("drift_count"):
+        warn(f"drift audit entries: {summary['drift_count']} "
+             "(see manifest drift_audit)")
+    ok(f"manifest: {summary['manifest']}")
+    info(f"mirror:   {summary['mirror']}")
+    info(f"sha256:   {summary['manifest_sha256']}...")
+    info("Next: bughunter recon <target> uses scope_checker against these "
+         "patterns; manifest integrity is verified on every load.")
 
 
 # ── Utility ────────────────────────────────────────────────────────────────────
@@ -1260,6 +1379,28 @@ def main():
     p_chain.add_argument("--findings-dir", default="", help="Path to findings/<target> directory")
     p_chain.add_argument("finding", nargs="?", default="", help="Bug A description (or pipe via stdin)")
 
+    p_scope_compile = sub.add_parser(
+        "scope-compile", aliases=["sc"],
+        help="Compile a program scope into a typed, hashed manifest "
+             "(authenticated paginated REST / keyless GraphQL fallback)")
+    p_scope_compile.add_argument(
+        "handle",
+        help="Program handle or full H1 program URL "
+             "(e.g. cloudflare or https://hackerone.com/cloudflare?type=team)")
+    p_scope_compile.add_argument(
+        "--output", default="",
+        help="Primary manifest path (default: <recon>/<handle>/scope/"
+             "compiled_scope.json, honors RECON_OUT_DIR)")
+    p_scope_compile.add_argument(
+        "--h1scope-csv", dest="h1scope_csv", default="",
+        help="h1scope CSV export to reconcile (allowlist intersection)")
+    p_scope_compile.add_argument(
+        "--huntdeck-db", dest="huntdeck_db", default="",
+        help="HuntDeck SQLite DB (opened read-only) to reconcile")
+    p_scope_compile.add_argument(
+        "--bbscope-cache", dest="bbscope_cache", default="",
+        help="bbscope '-o tu' cache to reconcile")
+
     p_mcp = sub.add_parser("mcp", help="MCP server / doctor / tool catalog")
     p_mcp.add_argument(
         "mcp_command",
@@ -1281,6 +1422,29 @@ def main():
     if model_override:
         os.environ["BRAIN_MODEL"] = model_override
 
+    # ── Multi-platform credential vault (Commit 1) ─────────────────────────
+    # Every subcommand gets the 4-tier credential loader (env ->
+    # $BUGHUNTER_CREDENTIALS_FILE -> ~/.bughunter/.env -> /root/.secrets/h1_api)
+    # applied first, so platform tools (bbscope, HuntDeck, h1-brain, PDCP/
+    # Chaos-backed recon) and LLM providers all see the same credentials.
+    # Non-interactive here by design: the wizard runs via `bughunter setup`
+    # or `python3 bughunter/tools/credentials.py --setup`. Blank KEY=""
+    # entries are ignored, and file permissions are auto-tightened (dir 0700,
+    # file 0600). A vault failure must never kill the CLI.
+    try:
+        sys.path.insert(0, str(HERE))
+        from tools.credentials import load_credentials  # noqa: PLC0415
+    except ImportError:
+        try:
+            from credentials import load_credentials  # noqa: PLC0415
+        except ImportError:
+            load_credentials = None
+    if load_credentials is not None:
+        try:
+            load_credentials(interactive=False)
+        except Exception as exc:
+            warn(f"credential vault load failed: {exc}")
+
     # Load saved API keys into environment before any LLM call
     cfg = load_config()
     for env_var in ("GROQ_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY",
@@ -1291,7 +1455,7 @@ def main():
             os.environ[env_var] = cfg[env_var]
 
     quiet_cmds = {"status", "providers", "models", "mcp", "login", "auth",
-                  "doctor", None}
+                  "doctor", "scope-compile", "sc", None}
     if not getattr(args, "no_banner", False) and args.command not in quiet_cmds:
         _print_banner()
 
@@ -1311,6 +1475,8 @@ def main():
         "status":    cmd_status,
         "doctor":    cmd_doctor,
         "mcp":       cmd_mcp,
+        "scope-compile": cmd_scope_compile,
+        "sc":        cmd_scope_compile,
     }
 
     if not args.command:

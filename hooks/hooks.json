@@ -14,6 +14,17 @@
       {
         "command": "echo 'Hunt complete. Checklist: findings saved? scope verified? reports in reports/? run /validate on any unvalidated leads.'"
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|mcp__bughunter-mcp__bughunter_recon|mcp__bughunter-mcp__bughunter_hunt|mcp__bughunter-mcp__bughunter_hunt_class|mcp__bughunter-mcp__bughunter_research|mcp__bughunter-mcp__bughunter_run_rtw_capability",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 bughunter/tools/hook_scope_guard.py"
+          }
+        ]
+      }
     ]
   }
 }

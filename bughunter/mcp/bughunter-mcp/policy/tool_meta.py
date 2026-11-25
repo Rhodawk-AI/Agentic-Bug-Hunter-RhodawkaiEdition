@@ -73,6 +73,13 @@ TOOL_META: dict[str, ToolSecurity] = {
     "bughunter_update_lead": ToolSecurity(idempotent=False),
     "bughunter_program": ToolSecurity(read_only=True, network_access=True),
     "bughunter_program_policy": ToolSecurity(read_only=True, network_access=True),
+    # Commit 3 additions. bughunter_compile_scope fetches PUBLIC program data
+    # (no target traffic) and writes local manifests — read-only w.r.t. the
+    # target, network-touching. The two surface-slicing tools are strictly
+    # local recon-artifact readers.
+    "bughunter_compile_scope": ToolSecurity(read_only=True, network_access=True),
+    "bughunter_prioritized_surface": ToolSecurity(read_only=True),
+    "bughunter_inspect_endpoint_slice": ToolSecurity(read_only=True),
 }
 
 

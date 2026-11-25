@@ -93,6 +93,57 @@ def _audit_caller_scope(tool: str, capability_id: str, target: str,
         pass
 
 
+def _resolve_scope(scope_domains: list[str] | None,
+                   manifest_path: str | None = None):
+    """Resolve the ONE scope authority for a tool call (Commit 3, fail-closed).
+
+    Resolution order:
+      1. explicit scope_domains          -> POLICY.set_scope
+      2. explicit manifest_path          -> POLICY.load_manifest (SHA-256 verified)
+      3. active session manifest         -> previously loaded via load_manifest /
+                                            bughunter_compile_scope
+      4. otherwise                       -> DENIED (SCOPE_REQUIRED)
+
+    The old `scope_domains or [target]` self-authorization is GONE: a tool
+    call that names a target without any scope source can no longer invent
+    its own allowlist from the very string it was asked to attack.
+
+    Returns (domains, source, denied_payload); domains/source are None when
+    denied_payload is set.
+    """
+    if scope_domains:
+        domains = [str(d) for d in scope_domains if str(d).strip()]
+        if domains:
+            POLICY.set_scope(domains)
+            return domains, "domains", None
+    if manifest_path:
+        try:
+            POLICY.load_manifest(manifest_path)
+        except (ValueError, OSError) as exc:
+            return None, None, {
+                "status": "denied",
+                "error": "SCOPE_REQUIRED",
+                "reason": (f"scope manifest unusable (fail-closed): {exc}"),
+                "next_action": {
+                    "fix": "Recompile with bughunter_compile_scope or pass an intact manifest_path",
+                },
+            }
+        return list(POLICY._domains), "manifest", None
+    if POLICY.manifest is not None and POLICY._domains and POLICY._checker is not None:
+        return list(POLICY._domains), "session", None
+    return None, None, {
+        "status": "denied",
+        "error": "SCOPE_REQUIRED",
+        "reason": ("No scope authorized for this session: pass explicit "
+                   "scope_domains, a manifest_path, or call "
+                   "bughunter_compile_scope(program_handle) first. The server "
+                   "no longer accepts the target string as its own scope."),
+        "next_action": {
+            "fix": "Call bughunter_compile_scope(program_handle), or pass scope_domains / manifest_path",
+        },
+    }
+
+
 def _gate(tool: str, args: dict[str, Any]) -> dict[str, Any] | None:
     decision = POLICY.authorize_tool(tool, args)
     if not decision.allowed:
@@ -119,40 +170,52 @@ def bughunter_research(
     scope_domains: list[str] | None = None,
     program_context: str = "",
     approve: bool = False,
+    manifest_path: str | None = None,
 ) -> dict[str, Any]:
     """Run an intelligent bug-bounty research workflow using the existing engine.
 
     Modes: RECON | HUNT | VALIDATE | REPORT | FULL.
     Does not force every stage — pick the stage you need.
-    Requires scope_domains and approve=true for active modes.
+    Requires a scope source (scope_domains, manifest_path, or a session
+    manifest from bughunter_compile_scope) and approve=true for active modes.
     Does not submit reports.
     """
+    scope, source, denied = _resolve_scope(scope_domains, manifest_path)
+    if denied:
+        return denied
     args = {
         "target": target,
-        "scope_domains": scope_domains or [target],
         "approve": approve,
         "program_context": program_context,
     }
+    if source == "domains":
+        args["scope_domains"] = scope
+    if manifest_path:
+        args["manifest_path"] = manifest_path
     denied = _gate("bughunter_research", args)
     if denied:
         return denied
-    domains = scope_domains or [target]
-    POLICY.set_scope(domains)
-    return redact_obj(adapters.research(target, mode, domains, approve=approve))
+    return redact_obj(adapters.research(target, mode, scope, approve=approve))
 
 
 @mcp.tool(title="Scope check", annotations=_ann(read_only=True))
 def bughunter_scope_check(
     target: str,
     scope_domains: list[str] | None = None,
+    manifest_path: str | None = None,
 ) -> dict[str, Any]:
     """Check whether a host/URL is in the configured program allowlist.
 
     Use before any active research. Read-only. Does not probe the target.
+    Fails closed with SCOPE_REQUIRED when no scope source exists — the
+    target string is never used as its own allowlist.
     """
-    domains = scope_domains or [target]
-    POLICY.set_scope(domains)
-    return redact_obj(adapters.scope_check(target, domains))
+    scope, source, denied = _resolve_scope(scope_domains, manifest_path)
+    if denied:
+        return denied
+    result = adapters.scope_check(target, scope)
+    result["scope_source"] = source
+    return redact_obj(result)
 
 
 @mcp.tool(title="Get scope", annotations=_ann(read_only=True))
@@ -174,16 +237,25 @@ def bughunter_recon(
     target: str,
     scope_domains: list[str] | None = None,
     approve: bool = False,
+    manifest_path: str | None = None,
 ) -> dict[str, Any]:
     """Map the attack surface of an authorized bug-bounty target via recon_engine.sh.
 
-    Active network recon. Requires scope + approve=true.
+    Active network recon. Requires a scope source (scope_domains,
+    manifest_path, or session manifest) + approve=true. Without one the call
+    is denied with SCOPE_REQUIRED — the target is never its own scope.
     """
-    args = {"target": target, "scope_domains": scope_domains or [target], "approve": approve}
+    scope, source, denied = _resolve_scope(scope_domains, manifest_path)
+    if denied:
+        return denied
+    args = {"target": target, "approve": approve}
+    if source == "domains":
+        args["scope_domains"] = scope
+    if manifest_path:
+        args["manifest_path"] = manifest_path
     denied = _gate("bughunter_recon", args)
     if denied:
         return denied
-    POLICY.set_scope(scope_domains or [target])
     return redact_obj(adapters.run_recon(target, scope_checker=POLICY._checker))
 
 
@@ -193,6 +265,7 @@ def bughunter_run_rtw_capability(
     target: str,
     scope_domains: list[str] | None = None,
     approve: bool = False,
+    manifest_path: str | None = None,
 ) -> dict[str, Any]:
     """Delegate ONE recon capability gap to reconFTW deterministically.
 
@@ -201,20 +274,29 @@ def bughunter_run_rtw_capability(
     CAP_VHOSTS, CAP_TLS_PIVOTS, CAP_FAVICON). The routing decision is
     deterministic code (capability_registry.py + tools/rtw_adapter.py), never
     a model judgment call: availability comes from capabilities.json, scope
-    is fail-closed, every output file is scope-filtered post-call, and results
-    land in the shared rtw_manifest.json schema the CLI/agent/harness
-    runtimes also write. Requires scope + approve=true.
+    is fail-closed (scope_domains, manifest_path, or session manifest —
+    never the target string itself), every output file is scope-filtered
+    post-call, and results land in the shared rtw_manifest.json schema the
+    CLI/agent/harness runtimes also write. Requires scope + approve=true.
     """
-    args = {"target": target, "scope_domains": scope_domains or [target], "approve": approve}
+    scope, source, denied = _resolve_scope(scope_domains, manifest_path)
+    if denied:
+        return denied
+    args = {"target": target, "approve": approve}
+    if source == "domains":
+        args["scope_domains"] = scope
+    if manifest_path:
+        args["manifest_path"] = manifest_path
     denied = _gate("bughunter_run_rtw_capability", args)
     if denied:
         return denied
-    # Self-authorization transparency (docs/mcp.md): the CALLER supplies the
-    # scope this tool runs under — behavior is unchanged, but the caller's
-    # scope declaration is now recorded in the audit log.
-    _audit_caller_scope("bughunter_run_rtw_capability", capability_id,
-                        target, scope_domains or [target])
-    POLICY.set_scope(scope_domains or [target])
+    # Self-authorization transparency (docs/mcp.md): when the CALLER supplies
+    # the scope_domains this tool runs under, the declaration is recorded in
+    # the audit log. Manifest/session flows authorize from the verified
+    # artifact instead and are not caller self-authorization.
+    if source == "domains":
+        _audit_caller_scope("bughunter_run_rtw_capability", capability_id,
+                            target, scope)
     return redact_obj(
         adapters.run_rtw_capability(capability_id, target,
                                     scope_checker=POLICY._checker))
@@ -252,16 +334,24 @@ def bughunter_hunt(
     target: str,
     scope_domains: list[str] | None = None,
     approve: bool = False,
+    manifest_path: str | None = None,
 ) -> dict[str, Any]:
     """Run vulnerability hunting within established scope using existing hunt tools.
 
-    Active testing. Requires scope + approve=true. Does not auto-submit findings.
+    Active testing. Requires a scope source (scope_domains, manifest_path, or
+    session manifest) + approve=true. Does not auto-submit findings.
     """
-    args = {"target": target, "scope_domains": scope_domains or [target], "approve": approve}
+    scope, source, denied = _resolve_scope(scope_domains, manifest_path)
+    if denied:
+        return denied
+    args = {"target": target, "approve": approve}
+    if source == "domains":
+        args["scope_domains"] = scope
+    if manifest_path:
+        args["manifest_path"] = manifest_path
     denied = _gate("bughunter_hunt", args)
     if denied:
         return denied
-    POLICY.set_scope(scope_domains or [target])
     return redact_obj(adapters.run_hunt(target, scope_checker=POLICY._checker))
 
 
@@ -271,16 +361,33 @@ def bughunter_hunt_class(
     vuln_class: str,
     scope_domains: list[str] | None = None,
     approve: bool = False,
+    manifest_path: str | None = None,
 ) -> dict[str, Any]:
     """Focus hunting toward a vuln class via lead-board skill routing context.
 
-    Active. Requires scope + approve. Full class-specific scanners remain in slash skills.
+    Active. Requires a scope source + approve. Full class-specific scanners
+    remain in slash skills. Classes excluded by the loaded manifest's
+    excluded_classes are refused up front.
     """
-    args = {"target": target, "scope_domains": scope_domains or [target], "approve": approve}
+    scope, source, denied = _resolve_scope(scope_domains, manifest_path)
+    if denied:
+        return denied
+    if not POLICY._checker.is_vuln_class_allowed(vuln_class):
+        return {
+            "status": "denied",
+            "error": "OUT_OF_SCOPE",
+            "reason": f"vulnerability class '{vuln_class}' is excluded by the program scope",
+            "excluded_classes": list(POLICY._excluded_classes or []),
+            "next_action": "Pick a class the program rewards",
+        }
+    args = {"target": target, "approve": approve}
+    if source == "domains":
+        args["scope_domains"] = scope
+    if manifest_path:
+        args["manifest_path"] = manifest_path
     denied = _gate("bughunter_hunt_class", args)
     if denied:
         return denied
-    POLICY.set_scope(scope_domains or [target])
     out = adapters.run_hunt(target, scope_checker=POLICY._checker)
     out["vuln_class"] = vuln_class
     out["summary"] = f"Hunt with class hint={vuln_class}: " + str(out.get("summary", ""))
@@ -310,13 +417,21 @@ def bughunter_validate(
     target: str,
     scope_domains: list[str] | None = None,
     approve: bool = False,
+    manifest_path: str | None = None,
 ) -> dict[str, Any]:
     """Load existing validation.json / point to tools/validate.py seven-question workflow.
 
     Use before treating a candidate as reportable. Does not invent evidence.
     Prefer running interactive validate.py for full gates; this returns stored results.
     """
-    args = {"target": target, "scope_domains": scope_domains or [target], "approve": approve}
+    scope, source, denied = _resolve_scope(scope_domains, manifest_path)
+    if denied:
+        return denied
+    args = {"target": target, "approve": approve}
+    if source == "domains":
+        args["scope_domains"] = scope
+    if manifest_path:
+        args["manifest_path"] = manifest_path
     denied = _gate("bughunter_validate", args)
     if denied:
         return denied
@@ -414,6 +529,69 @@ def bughunter_program(handle: str) -> dict[str, Any]:
 def bughunter_program_policy(handle: str) -> dict[str, Any]:
     """Fetch public HackerOne program policy/scope text via existing helpers. Does not submit reports."""
     return redact_obj(adapters.program_policy(handle))
+
+
+@mcp.tool(title="Compile scope", annotations=_ann(read_only=True, open_world=True))
+def bughunter_compile_scope(program_handle: str) -> dict[str, Any]:
+    """Compile a HackerOne program's scope into a typed, SHA-256-verified
+    CompiledScopeManifest and load it as THIS session's scope authority.
+
+    Routes through tools/scope_compiler.py: authenticated paginated REST when
+    vault credentials exist, keyless public fallbacks otherwise (no >50-entry
+    truncation, exact handle matching). Credentials load exclusively via
+    tools/credentials.py and are never logged or stored. Returns the redacted
+    summary + manifest path; once this succeeds, active tools are authorized
+    by the manifest without scope_domains.
+    """
+    result = redact_obj(adapters.compile_scope(program_handle))
+    if result.get("status") == "completed" and result.get("manifest"):
+        try:
+            loaded = POLICY.load_manifest(result["manifest"])
+            result["policy_loaded"] = True
+            result["session_scope_authorized"] = True
+            result["excluded_classes"] = loaded["excluded_classes"]
+            result["mandatory_headers"] = loaded["mandatory_headers"]
+            result["max_rps"] = loaded["max_rps"]
+        except (ValueError, OSError) as exc:
+            result["policy_loaded"] = False
+            result["policy_load_error"] = str(exc)[:200]
+            result["status"] = "failed"
+            result["error"] = "SCOPE_REQUIRED"
+    return result
+
+
+@mcp.tool(title="Prioritized surface", annotations=_ann(read_only=True))
+def bughunter_prioritized_surface(target: str, limit: int = 20) -> dict[str, Any]:
+    """Compact ranked view of the recon attack surface (read-only, bounded).
+
+    Reads recon_truth.json (and h1-brain disclosed_reports.db when present)
+    and returns a deterministic ranked list of the most promising hosts:
+    HTTP 200s, auth walls, parameterized URLs, open ports, net-new
+    subdomains, disclosed-report history. Response is capped at 4096 bytes —
+    designed for direct LLM consumption without flooding context.
+    """
+    return redact_obj_capped(adapters.prioritized_surface(target, limit))
+
+
+@mcp.tool(title="Inspect endpoint slice", annotations=_ann(read_only=True))
+def bughunter_inspect_endpoint_slice(target: str, endpoint: str) -> dict[str, Any]:
+    """Bounded slice of ONE endpoint: strictly status/headers-context/params/snippet.
+
+    Reads only local recon artifacts (live/httpx_full.txt, params/all.txt) —
+    no network, no response bodies, no secret dumps. Response capped at
+    4096 bytes for context-safe LLM consumption.
+    """
+    return redact_obj_capped(adapters.inspect_endpoint_slice(target, endpoint))
+
+
+def redact_obj_capped(payload: dict[str, Any]) -> dict[str, Any]:
+    """Redact, THEN enforce the 4096-byte response cap (Commit 3).
+
+    Redaction can expand a payload (it rewrites values), so the bounded-
+    slicing guarantee must be applied as the LAST step — the tool response
+    the caller receives is what must fit the cap, not the pre-redaction
+    object."""
+    return adapters._cap_bytes(redact_obj(payload))
 
 
 def main() -> None:

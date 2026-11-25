@@ -6,20 +6,37 @@ description: Run the full recon pipeline by invoking bughunter/tools/recon_engin
 
 Run the full recon pipeline on a target. **Always invoke the production script directly** — do not re-implement the steps inline. The methodology below is reference material; the script is the entry point.
 
+## Pre-Recon: Compile Scope First (authoritative)
+
+Recon is fail-closed. Compile the verified manifest before running the engine — `recon/<handle>/scope/compiled_scope.json` is the single scope authority for the whole pipeline (see `bughunter/prompts/kernel.md`):
+
+```bash
+bughunter scope-compile <handle>
+# -> recon/<handle>/scope/compiled_scope.json   (typed CompiledScopeManifest, SHA-256 self-verifying)
+
+bughunter_compile_scope(program_handle="<handle>")   # MCP equivalent
+```
+
+Without a valid manifest (or explicit scope patterns) the engine exits 3 **before any probe** — that is the design, not a malfunction. Recompile scope; never retry with the gate stripped off.
+
 ## Run This (the only required step)
 
 ```bash
-# Domain (full subdomain enum + crawl + fuzz):
+# Domain (full subdomain enum + crawl + fuzz), scoped by the verified manifest:
+bash bughunter/tools/recon_engine.sh target.com --scope-manifest recon/<handle>/scope/compiled_scope.json
+
+# Auto-detect — the engine picks up recon/<target>/scope/compiled_scope.json when present:
 bash bughunter/tools/recon_engine.sh target.com
 
 # CIDR — skips subdomain enum, runs nmap host sweep:
-bash bughunter/tools/recon_engine.sh 10.0.0.0/24
+bash bughunter/tools/recon_engine.sh 10.0.0.0/24 --scope-manifest recon/<handle>/scope/compiled_scope.json
 
 # Single IP — scope-locked, no subdomain enum:
-bash bughunter/tools/recon_engine.sh 192.0.2.10
+bash bughunter/tools/recon_engine.sh 192.0.2.10 --scope-manifest recon/<handle>/scope/compiled_scope.json
 
 # Domain list (programs without wildcard scope) — pre-resolved hosts in a file:
-bash bughunter/tools/recon_engine.sh path/to/scope.txt
+# (list mode is still manifest-filtered — the list is never trusted as scope)
+bash bughunter/tools/recon_engine.sh path/to/scope.txt --scope-manifest recon/<handle>/scope/compiled_scope.json
 
 # Quick mode (skip amass + reduce ffuf coverage):
 bash bughunter/tools/recon_engine.sh target.com --quick
@@ -35,6 +52,8 @@ Output lands in `recon/<target>/` (or `recon/<file-basename>/` for list mode):
 
 ```
 recon/<target>/
+├── scope/compiled_scope.json   (verified manifest, if scope-compile ran for this program)
+├── scope/dropped_oos.txt       (out-of-scope + third-party SaaS CNAMEs, isolated pre-probe)
 ├── subdomains/all.txt
 ├── rtw/<function>/          (reconFTW gap-fill output, Phases 1.5 + 5.5)
 ├── live/urls.txt
