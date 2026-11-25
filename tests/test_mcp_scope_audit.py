@@ -12,6 +12,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MCP_DIR = REPO_ROOT / "bughunter" / "mcp" / "bughunter-mcp"
 
@@ -26,7 +28,15 @@ def _load_server():
     spec = importlib.util.spec_from_file_location(
         "bughunter_mcp_server", MCP_DIR / "server.py")
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    try:
+        spec.loader.exec_module(mod)
+    except SystemExit as exc:
+        # server.py exits with its own guarded error when the installed
+        # `mcp` SDK predates the MCPServer API (repo pins mcp>=2.2.0). That
+        # is purely an upstream SDK-version mismatch, not a bug in the code
+        # under test — skip (same pattern as tests/test_mcp_rtw.py) instead
+        # of failing. The audited function is a pure audit-log writer.
+        pytest.skip(f"mcp MCPServer API unavailable in this environment: {exc}")
     return mod
 
 

@@ -56,15 +56,20 @@ TARGET=""
 QUICK_MODE=""
 SCOPE_DOMAIN_ARGS=()
 SCOPE_EXCLUDE_ARGS=()
+SCOPE_MANIFEST_ARG=""
 SCOPE_OPT_OUT=0
 _rtw_engine_usage() {
     echo "Usage: $0 <target> [--quick]"
     echo "                     [--scope-domain PATTERN]... [--scope-exclude PATTERN]..."
-    echo "                     [--no-scope-check]"
+    echo "                     [--scope-manifest PATH] [--no-scope-check]"
     echo "  target = FQDN, IP, CIDR, or path to a file of domains/hosts"
+    echo "  --scope-manifest PATH   use a compiled_scope.json manifest (Commit 2"
+    echo "                          artifact, SHA-256 verified) as the single scope"
+    echo "                          authority; auto-detected at"
+    echo "                          \$RECON_DIR/scope/compiled_scope.json when present"
     echo "  --scope-domain / --scope-exclude are forwarded to the reconFTW"
-    echo "  gap-fill adapter (Phases 1.5/5.5). Without them (or without"
-    echo "  --no-scope-check) reconFTW delegation fails closed."
+    echo "  gap-fill adapter (Phases 1.5/5.5). Without any scope source (or"
+    echo "  without --no-scope-check) the engine fails closed."
 }
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -80,6 +85,9 @@ while [ $# -gt 0 ]; do
         --scope-exclude)
             [ $# -lt 2 ] && { echo "[-] --scope-exclude requires a pattern" >&2; exit 1; }
             SCOPE_EXCLUDE_ARGS+=("$2"); shift 2 ;;
+        --scope-manifest)
+            [ $# -lt 2 ] && { echo "[-] --scope-manifest requires a path" >&2; exit 1; }
+            SCOPE_MANIFEST_ARG="$2"; shift 2 ;;
         --no-scope-check)
             SCOPE_OPT_OUT=1; shift ;;
         -h|--help)
@@ -153,7 +161,9 @@ _rtw_run_phase() {
 # file); the dropped total lands in the Recon Summary and in recon_truth.json
 # (counts.scope_dropped). No-op when --no-scope-check is passed; patternless
 # targets self-scope to the target itself (ip/local/cidr); list targets are
-# pre-resolved scope lists, so they are left untouched.
+# filtered when scope patterns or a verified manifest are provided (Commit 3
+# closes the previous blind-trust bypass) and only skip filtering when the
+# list itself is the only scope definition.
 SCOPE_DROPPED_TOTAL=0
 _abh_scope_filter() {
     [ "$SCOPE_OPT_OUT" = "1" ] && return 0
@@ -161,7 +171,17 @@ _abh_scope_filter() {
     [ -f "$_f" ] || return 0
     [ -s "$_f" ] || return 0
     local _filter_args=()
-    if [ ${#SCOPE_DOMAIN_ARGS[@]} -gt 0 ]; then
+    if [ -n "${SCOPE_MANIFEST:-}" ]; then
+        # Commit 3: a verified compiled manifest is the single scope authority
+        # for filtering — for EVERY target type, including list-mode targets
+        # (previously a list skipped filtering entirely, trusting its
+        # contents blindly). Explicit patterns alongside a manifest could
+        # only widen scope, so they are ignored (loudly).
+        if [ ${#SCOPE_DOMAIN_ARGS[@]} -gt 0 ]; then
+            log_warn "Scope filter: --scope-domain patterns IGNORED — the verified manifest is the single authority"
+        fi
+        _filter_args=(--manifest "$SCOPE_MANIFEST")
+    elif [ ${#SCOPE_DOMAIN_ARGS[@]} -gt 0 ]; then
         _filter_args=("${SC_CHECK_ARGS[@]}")
     else
         case "$(printf '%s' "${TARGET_TYPE:-}" | tr -d '[:space:]')" in
@@ -189,9 +209,14 @@ _abh_scope_filter() {
             log_info "Scope filter: dropped $_n out-of-scope line(s) from $_rel (scope/dropped_oos.txt)"
         fi
     else
-        # The checker itself failed — never silently probe unfiltered data.
-        cp "$_tmp_in" "$_f" 2>/dev/null || true
-        log_warn "Scope filter FAILED for $_rel — file left UNFILTERED (checker error); investigate python3 tools/scope_checker.py"
+        # Commit 3 FAIL-CLOSED fix (was fail-open): the checker itself failed
+        # — previously the UNFILTERED backup was restored and the run
+        # continued, probing whatever subfinder returned. Never probe
+        # unfiltered data: log, audit, and abort before any probe tool runs.
+        log_err "SCOPE BLOCK: scope filter FAILED for $_rel (scope_checker.py exited non-zero) — aborting the run instead of probing unfiltered data"
+        _abh_audit_scope_block "scope filter crash on ${_rel}: scope_checker.py exited non-zero (fail-closed)"
+        rm -f "$_tmp_in" "$_tmp_drop"
+        exit 3
     fi
     rm -f "$_tmp_in" "$_tmp_drop"
 }
@@ -266,6 +291,21 @@ if [ -n "${RECON_OUT_DIR:-}" ]; then
 else
     RECON_DIR="$BASE_DIR/recon/$TARGET${TARGET_PORT:+_$TARGET_PORT}"
 fi
+
+# ── Compiled scope manifest (Commit 3): detect BEFORE rate-limit defaults ────
+# Explicit --scope-manifest wins; otherwise auto-detect the Commit 2 artifact
+# at $RECON_DIR/scope/compiled_scope.json (written by scope_compiler.py —
+# re-running the engine for a target whose scope was previously compiled now
+# picks it up automatically). Existence is checked here; SHA-256 integrity and
+# target membership are enforced by the pre-flight scope gate below (fail-
+# closed, exit 3) so a tampered manifest can never authorize a run.
+SCOPE_MANIFEST=""
+if [ -n "${SCOPE_MANIFEST_ARG:-}" ]; then
+    SCOPE_MANIFEST="$SCOPE_MANIFEST_ARG"
+elif [ -f "$RECON_DIR/scope/compiled_scope.json" ]; then
+    SCOPE_MANIFEST="$RECON_DIR/scope/compiled_scope.json"
+fi
+
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 THREADS="${BB_THREADS:-50}"
 RATE_LIMIT="${BB_RATE_LIMIT:-150}"  # requests per second
@@ -375,6 +415,21 @@ _abh_audit_scope_block() {
 SCOPE_GATE_BLOCK=""
 if [ "$SCOPE_OPT_OUT" = "1" ]; then
     log_warn "Scope gate: --no-scope-check opt-out — running UNSCOPED (demo/testing only)"
+elif [ -n "$SCOPE_MANIFEST" ]; then
+    # Commit 3: a compiled manifest (explicit --scope-manifest or auto-detected)
+    # IS the scope authority. Fail closed on: missing file, tampered SHA-256
+    # hash, or a target that the manifest does not authorize. List-mode
+    # targets validate the manifest here; their contents are enforced line-
+    # by-line by _abh_scope_filter (no more blind trust).
+    if [ ! -f "$SCOPE_MANIFEST" ]; then
+        SCOPE_GATE_BLOCK="--scope-manifest '$SCOPE_MANIFEST' not found (fail-closed)"
+    elif ! python3 "$BASE_DIR/tools/scope_checker.py" --manifest "$SCOPE_MANIFEST" >/dev/null 2>&1; then
+        SCOPE_GATE_BLOCK="scope manifest failed SHA-256 integrity validation: $SCOPE_MANIFEST"
+    elif [ "$TARGET_TYPE" != "list" ] && ! python3 "$BASE_DIR/tools/scope_checker.py" --manifest "$SCOPE_MANIFEST" "$TARGET" >/dev/null 2>&1; then
+        SCOPE_GATE_BLOCK="target '$TARGET' is outside the scope manifest"
+    else
+        log_info "Scope gate: compiled manifest verified ($SCOPE_MANIFEST)"
+    fi
 elif [ "$TARGET_TYPE" != "domain" ]; then
     log_info "Scope gate: target type '$TARGET_TYPE' self-scopes to the target itself"
 elif [ ${#SCOPE_DOMAIN_ARGS[@]} -eq 0 ]; then
@@ -390,6 +445,63 @@ if [ -n "$SCOPE_GATE_BLOCK" ]; then
     log_err "0 packets sent, 0 tools executed. Pass --scope-domain PATTERN (repeatable) or --no-scope-check for local demo testing."
     _abh_audit_scope_block "$SCOPE_GATE_BLOCK"
     exit 3
+fi
+
+# ── Manifest-derived runtime knobs (Commit 3) ─────────────────────────────────
+# The verified manifest now drives: (a) every downstream scope check (B2
+# redirect classification, filters) via SC_CHECK_ARGS repointed at the
+# manifest; (b) mandatory auth headers exported into BBHUNT_AUTH_HEADERS
+# (only when the caller did not supply any — caller-provided headers win);
+# (c) BB_RATE_LIMIT integer-ceilinged from manifest.max_rps (caller-provided
+# value wins). Re-source _auth_helper.sh so BB_AUTH_ARGS picks up the
+# exported manifest headers before the first probe runs.
+if [ -n "$SCOPE_MANIFEST" ]; then
+    if [ ${#SCOPE_DOMAIN_ARGS[@]} -gt 0 ]; then
+        log_warn "Scope authority: --scope-domain patterns present alongside a manifest — patterns are IGNORED everywhere (manifest wins)"
+    fi
+    SC_CHECK_ARGS=(--manifest "$SCOPE_MANIFEST")
+
+    if [ -z "${BBHUNT_AUTH_HEADERS:-}" ]; then
+        _mf_headers="$(python3 - "$SCOPE_MANIFEST" <<'PYEOF'
+import json, sys
+try:
+    m = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+h = m.get("mandatory_headers") or {}
+if isinstance(h, dict):
+    print("\n".join(f"{k}: {v}" for k, v in h.items()), end="")
+PYEOF
+)" || _mf_headers=""
+        if [ -n "${_mf_headers:-}" ]; then
+            export BBHUNT_AUTH_HEADERS="$_mf_headers"
+            log_info "Scope manifest: exported BBHUNT_AUTH_HEADERS from mandatory_headers"
+        fi
+        unset _mf_headers
+    fi
+
+    if [ -z "${BB_RATE_LIMIT:-}" ]; then
+        _mf_rps="$(python3 - "$SCOPE_MANIFEST" <<'PYEOF'
+import json, math, sys
+try:
+    m = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+v = m.get("max_rps")
+if isinstance(v, (int, float)) and v > 0:
+    print(int(math.ceil(v)))
+PYEOF
+)" || _mf_rps=""
+        if [ -n "${_mf_rps:-}" ]; then
+            export BB_RATE_LIMIT="$_mf_rps"
+            log_info "Scope manifest: exported BB_RATE_LIMIT=$_mf_rps (integer ceiling of max_rps)"
+        fi
+        unset _mf_rps
+    fi
+
+    # Rebuild BB_AUTH_ARGS now that manifest headers (if any) are exported.
+    # shellcheck source=tools/_auth_helper.sh
+    . "$(dirname "$0")/_auth_helper.sh"
 fi
 
 # For IP/CIDR/local: always scope-lock — no subdomain enum needed
@@ -450,7 +562,13 @@ if [ -d "$RECON_DIR" ] && [ -n "$(ls -A "$RECON_DIR" 2>/dev/null)" ]; then
     fi
     [ -f "$RECON_DIR/recon_truth.json" ] && \
         mv -f "$RECON_DIR/recon_truth.json" "$RECON_DIR/.prev_run/recon_truth.json"
-    find "$RECON_DIR" -mindepth 1 -maxdepth 1 -not -name '.prev_run' \
+    # Commit 3: the scope/ directory is STANDING AUTHORIZATION STATE, not a
+    # stale run artifact — compiled_scope.json (auto-detected by the gate on
+    # the next run) and the cumulative dropped_oos.txt quarantine log must
+    # survive the wipe. Excluding scope/ here also prevents the run from
+    # destroying its own scope authority mid-run when --scope-manifest points
+    # into $RECON_DIR.
+    find "$RECON_DIR" -mindepth 1 -maxdepth 1 -not -name '.prev_run' -not -name 'scope' \
         -exec rm -rf {} + 2>/dev/null || true
 fi
 
@@ -670,6 +788,126 @@ fi
 # B3 filter point 2/4: after the Phase 1.5 merge (gap-fill output was already
 # post-call filtered by the adapter; this re-checks the merged probe list).
 _abh_scope_filter "$RECON_DIR/subdomains/all.txt"
+
+# ── C6: pre-probe third-party SaaS CNAME quarantine (Commit 3) ────────────────
+# httpx is about to probe subdomains/all.txt. A subdomain whose CNAME points
+# into third-party SaaS (Zendesk, Statuspage, Greenhouse, Workday, ...)
+# is NOT the program's own infrastructure: probing it sends program traffic
+# to a vendor and flags recon activity on a shared tenant. BEFORE httpx
+# fires, resolve CNAMEs for the probe list and quarantine every alias whose
+# canonical target belongs to a known third-party SaaS: removed from
+# subdomains/all.txt, recorded in scope/dropped_oos.txt (source tag
+# cname_saas_gate), counted into SCOPE_DROPPED_TOTAL (Recon Summary +
+# recon_truth.json counts.scope_dropped).
+# Resolution order: dnsx -cname -resp (batched, fast) → dig +short CNAME
+# (bounded per-host) → Python socket.gethostbyname_ex (stdlib fallback;
+# returns the canonical name of the CNAME chain). BUGHUNTER_CNAME_MAP_FILE
+# (test/CI seam) injects pre-resolved "host<TAB>canonical" pairs and skips
+# all network resolution. All resolution paths are time-bounded; when
+# nothing can be resolved the gate is a no-op (the scope filters above
+# remain the fail-closed enforcement layer).
+_abh_cname_saas_gate() {
+    [ -s "$RECON_DIR/subdomains/all.txt" ] || return 0
+    mkdir -p "$RECON_DIR/scope"
+    local _cn_data="$RECON_DIR/scope/.cname_resp.txt"
+    : > "$_cn_data"
+    if [ -n "${BUGHUNTER_CNAME_MAP_FILE:-}" ] && [ -f "$BUGHUNTER_CNAME_MAP_FILE" ]; then
+        cp "$BUGHUNTER_CNAME_MAP_FILE" "$_cn_data" 2>/dev/null || true
+    elif command -v dnsx >/dev/null 2>&1; then
+        timeout 90 dnsx -l "$RECON_DIR/subdomains/all.txt" -cname -resp -silent \
+            -o "$_cn_data" >/dev/null 2>&1 || true
+    elif command -v dig >/dev/null 2>&1; then
+        # dig fallback: one host per query, bounded per query and capped at
+        # the first 1000 hosts (deterministic, sorted input) so a huge list
+        # can never stall the run. Output mirrors the dnsx/map file shape.
+        local _h _n=0
+        while IFS= read -r _h && [ "$_n" -lt 1000 ]; do
+            [ -z "$_h" ] && continue
+            _n=$((_n + 1))
+            local _tgt
+            _tgt="$(timeout 3 dig +short CNAME "$_h" 2>/dev/null | head -n 1 || true)"
+            [ -n "$_tgt" ] && printf '%s\t%s\n' "$_h" "$_tgt" >> "$_cn_data" || true
+        done < "$RECON_DIR/subdomains/all.txt"
+    else
+        # Pure-stdlib fallback: gethostbyname_ex returns the canonical
+        # (CNAME-chain) name — a different canonical name means the host is
+        # a CNAME alias. Non-resolving hosts are skipped (no data = no
+        # decision, and the scope filters remain authoritative).
+        timeout 60 python3 - "$RECON_DIR/subdomains/all.txt" "$_cn_data" <<'PYEOF' 2>/dev/null || true
+import socket, sys
+socket.setdefaulttimeout(2.0)
+hosts = [h.strip() for h in open(sys.argv[1], encoding="utf-8", errors="replace") if h.strip()][:1000]
+with open(sys.argv[2], "w", encoding="utf-8") as out:
+    for h in hosts:
+        try:
+            canonical = socket.gethostbyname_ex(h)[0]
+        except Exception:
+            continue
+        if canonical and canonical.lower() != h.lower():
+            out.write(f"{h}\t{canonical}\n")
+PYEOF
+    fi
+
+    # Match + quarantine (pure Python over the collected CNAME data).
+    local _cn_out
+    _cn_out="$(python3 - "$RECON_DIR/subdomains/all.txt" "$_cn_data" "$RECON_DIR/scope/dropped_oos.txt" <<'PYEOF' 2>/dev/null || true
+import sys
+probe_path, cname_path, dropped_path = sys.argv[1], sys.argv[2], sys.argv[3]
+SAAS = ("zendesk.com", "statuspage.io", "freshdesk.com", "myworkdayjobs.com",
+        "greenhouse.io", "lever.co", "salesforce.com", "shopify.com",
+        "github.io", "marketo.com")
+
+def clean(tok):
+    return tok.strip().strip("[]").rstrip(".").lower()
+
+def is_saas(host):
+    host = (host or "").lower().rstrip(".")
+    return any(host == s or host.endswith("." + s) for s in SAAS)
+
+# host -> the SaaS canonical target that quarantined it
+quarantined = {}
+for line in open(cname_path, encoding="utf-8", errors="replace"):
+    toks = [clean(t) for t in line.split() if clean(t)]
+    if len(toks) < 2:
+        continue
+    # First token is the queried host (dnsx response or map file). Quarantine
+    # it when ANY token on the line resolves to a third-party SaaS domain:
+    # either the CNAME answer (host is an alias INTO the SaaS tenant) or the
+    # queried host itself (the program pointed a subdomain at a SaaS host).
+    saas_tokens = [t for t in toks if is_saas(t)]
+    if saas_tokens:
+        alias = next((t for t in toks[1:] if is_saas(t)), saas_tokens[0])
+        quarantined.setdefault(toks[0], alias)
+
+kept, dropped = [], []
+for raw in open(probe_path, encoding="utf-8", errors="replace"):
+    h = raw.strip()
+    if not h:
+        continue
+    key = h.lower()
+    alias = quarantined.get(key) or quarantined.get(key.split(":")[0])
+    if alias:
+        dropped.append((h, alias))
+    else:
+        kept.append(h)
+
+if dropped:
+    with open(dropped_path, "a", encoding="utf-8") as df:
+        for h, alias in dropped:
+            df.write(f"cname_saas_gate\t{h}\tCNAME {alias}\n")
+    with open(probe_path, "w", encoding="utf-8") as pf:
+        for h in kept:
+            pf.write(h + "\n")
+print(len(dropped))
+PYEOF
+)"
+    if [ -n "${_cn_out:-}" ] && [ "$_cn_out" -gt 0 ] 2>/dev/null; then
+        SCOPE_DROPPED_TOTAL=$((SCOPE_DROPPED_TOTAL + _cn_out))
+        log_info "SaaS CNAME gate: quarantined $_cn_out third-party alias(es) from the probe list (scope/dropped_oos.txt)"
+    fi
+    rm -f "$_cn_data"
+}
+_abh_cname_saas_gate
 
 # ============================================================
 # Phase 2: HTTP Probing

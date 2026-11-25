@@ -572,3 +572,314 @@ def research(
     elif mode == "RECON":
         out["next_action"] = "bughunter_next_lead"
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Commit 3 — bounded surface-slicing tools + scope compilation adapter
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SLICE_BYTE_CAP = 4096
+
+
+def _json_size(payload: Any) -> int:
+    """Serialized byte size. ensure_ascii=True (the json.dumps default) makes
+    len(str) == byte length, so caps are byte-exact."""
+    return len(json.dumps(payload, ensure_ascii=True, sort_keys=True,
+                          separators=(",", ":")))
+
+
+def _cap_bytes(payload: dict[str, Any], cap: int = _SLICE_BYTE_CAP,
+               items_key: str = "items") -> dict[str, Any]:
+    """Guarantee the serialized payload never exceeds `cap` bytes.
+
+    Deterministic shedding order: (1) drop tail items from `items_key`,
+    (2) halve the free-text fields ("snippet", then "summary"), (3) last
+    resort return a truncated raw-JSON carrier. Same input always yields
+    the same output. Size is measured with COMPACT separators (the JSON
+    MCP transports actually emit); the shedding target keeps ~96 bytes of
+    headroom below the cap so even a client that re-serializes with
+    space-separated separators stays within `cap`.
+    """
+    target = min(cap, 3900)
+    if _json_size(payload) <= target:
+        return payload
+    p = json.loads(json.dumps(payload))  # deep copy, order-stable
+    items = p.get(items_key)
+    if isinstance(items, list):
+        while items and _json_size(p) > target:
+            items.pop()
+    for text_key in ("snippet", "summary"):
+        v = p.get(text_key)
+        if isinstance(v, str):
+            while v and _json_size(p) > target:
+                v = v[: max(len(v) // 2, 1)]
+            p[text_key] = v
+    if _json_size(p) <= target:
+        return p
+    raw = json.dumps(p, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return {
+        "status": "completed",
+        "truncated": True,
+        "truncated_json": raw[:cap],
+        "summary": f"payload exceeded {_SLICE_BYTE_CAP} bytes and was truncated",
+    }
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _disclosed_reports_counts(target: str) -> tuple[dict[str, int], str]:
+    """Best-effort h1-brain disclosed_reports.db lookup (read-only).
+
+    The DB is optional tooling: when it is absent, unreadable, or has an
+    unexpected schema this returns ({}, note) and the surface ranking simply
+    runs without report-history boosting. Never raises."""
+    candidates = []
+    env_home = os.environ.get("BUGHUNTER_HOME")
+    if env_home:
+        candidates.append(Path(env_home).expanduser() / "h1-brain" / "disclosed_reports.db")
+        candidates.append(Path(env_home).expanduser() / "h1_brain" / "disclosed_reports.db")
+    candidates.append(Path.home() / ".bughunter" / "h1-brain" / "disclosed_reports.db")
+    candidates.append(Path.home() / ".bughunter" / "h1_brain" / "disclosed_reports.db")
+    candidates.append(Path.home() / ".bughunter" / "disclosed_reports.db")
+    db_path = next((c for c in candidates if c.is_file()), None)
+    if db_path is None:
+        return {}, "h1-brain: disclosed_reports.db not present (skipped)"
+    try:
+        import sqlite3
+        apex = target.lower().lstrip("*.") or target.lower()
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        try:
+            counts: dict[str, int] = {}
+            for table in ("disclosed_reports", "reports"):
+                try:
+                    rows = con.execute(
+                        f"SELECT host, COUNT(*) c FROM {table} "
+                        "WHERE lower(host) LIKE ? GROUP BY lower(host) LIMIT 500",
+                        (f"%{apex}%",)).fetchall()
+                    for host, cnt in rows:
+                        if isinstance(host, str) and host:
+                            counts[host.lower()] = counts.get(host.lower(), 0) + int(cnt)
+                    if counts:
+                        break
+                except sqlite3.Error:
+                    continue
+        finally:
+            con.close()
+        return counts, f"h1-brain: {db_path.name} consulted ({len(counts)} host rows)"
+    except Exception as exc:  # noqa: BLE001 — optional enrichment must never fail a read-only tool
+        return {}, f"h1-brain: unavailable ({type(exc).__name__})"
+
+
+def prioritized_surface(target: str, limit: int = 20) -> dict[str, Any]:
+    """Compact ranked attack-surface list from recon_truth.json (read-only).
+
+    Deterministic scoring: HTTP 200 > auth walls (401/403) > redirects, with
+    boosts for parameterized URLs, open ports, fingerprints and net-new
+    hosts; h1-brain disclosed-report history (when present) adds a bounded
+    bonus. Response is capped at 4096 serialized bytes.
+    """
+    limit = max(1, min(int(limit), 50))
+    try:
+        base = _safe_under(REPO / "recon", target)
+    except UnsafeTargetError as exc:
+        return {"status": "failed", "error": "INVALID_TARGET", "reason": str(exc),
+                "target": target}
+    truth = _read_json_file(base / "recon_truth.json")
+    report_counts, brain_note = _disclosed_reports_counts(target)
+
+    scored: dict[str, dict] = {}
+
+    def _entry(host: str) -> dict:
+        return scored.setdefault(host.lower(), {"host": host, "score": 0, "reasons": []})
+
+    for rec in truth.get("hosts") or []:
+        if not isinstance(rec, dict) or not rec.get("host"):
+            continue
+        e = _entry(str(rec["host"]))
+        code = rec.get("status_code")
+        if code == 200:
+            e["score"] += 40
+            e["reasons"].append("http 200")
+        elif code in (301, 302, 303, 307, 308):
+            e["score"] += 25
+            e["reasons"].append("redirect")
+        elif code in (401, 403):
+            e["score"] += 20
+            e["reasons"].append(f"auth wall {code}")
+        elif code:
+            e["score"] += 5
+            e["reasons"].append(f"status {code}")
+        if rec.get("title"):
+            e["score"] += 5
+        tech = rec.get("tech") or []
+        e["score"] += min(2 * len(tech), 10)
+        if tech:
+            e["reasons"].append(f"tech: {','.join(map(str, tech[:4]))}")
+
+    for row in truth.get("urls") or []:
+        if not isinstance(row, dict):
+            continue
+        url = str(row.get("url") or "")
+        if "?" in url and "://" in url:
+            host = url.split("://", 1)[1].split("/", 1)[0].split(":")[0].lower()
+            e = _entry(host)
+            e["score"] += 15
+            if "parameters" not in e["reasons"]:
+                e["reasons"].append("parameterized URLs")
+
+    for row in truth.get("open_ports") or []:
+        if isinstance(row, dict) and row.get("host") and row.get("port"):
+            e = _entry(str(row["host"]))
+            e["score"] += 8
+            if f"port {row['port']}" not in e["reasons"]:
+                e["reasons"].append(f"port {row['port']}")
+
+    for host in truth.get("new_subdomains") or []:
+        if isinstance(host, str) and host:
+            e = _entry(host)
+            e["score"] += 10
+            if "net-new this run" not in e["reasons"]:
+                e["reasons"].append("net-new this run")
+
+    for host, cnt in report_counts.items():
+        bonus = min(3 * int(cnt), 15)
+        entry = _entry(host)
+        if entry["score"] == 0:
+            # host known only from disclosed-report history — still real,
+            # previously-confirmed surface for this program
+            entry["reasons"].append("surface from disclosed-report history")
+        entry["score"] += bonus
+        entry["reasons"].append(f"disclosed reports: {cnt}")
+
+    items = sorted(
+        ({"host": e["host"], "priority": e["score"], "reasons": e["reasons"][:4]}
+         for e in scored.values()),
+        key=lambda x: (-x["priority"], x["host"]),
+    )[:limit]
+    payload = {
+        "status": "completed",
+        "target": target,
+        "items": items,
+        "sources": {
+            "recon_truth": bool(truth),
+            "h1_brain": brain_note,
+        },
+        "summary": f"{len(items)} ranked surface entr(ies) for {target}",
+        "next_action": "bughunter_inspect_endpoint_slice",
+    }
+    return _cap_bytes(payload, items_key="items")
+
+
+def inspect_endpoint_slice(target: str, endpoint: str) -> dict[str, Any]:
+    """Strictly bounded slice of ONE endpoint (read-only, local artifacts).
+
+    Returns only: HTTP status, fingerprint/headers context (httpx tech
+    detection), parameters observed for the endpoint, and a short snippet of
+    the matching probe line. No bodies, no secrets dumps, response capped at
+    4096 serialized bytes.
+    """
+    endpoint = (endpoint or "").strip()
+    try:
+        base = _safe_under(REPO / "recon", target)
+    except UnsafeTargetError as exc:
+        return {"status": "failed", "error": "INVALID_TARGET", "reason": str(exc),
+                "target": target}
+    ep_norm = endpoint.lower()
+    if "://" in ep_norm:
+        ep_norm = ep_norm.split("://", 1)[1]
+    ep_norm = ep_norm.rstrip("/")
+
+    def _first_token(line: str) -> str:
+        return (line.split() or [""])[0].lower()
+
+    def _token_matches(tok: str) -> bool:
+        tok = tok.rstrip("/")
+        tok_noscheme = tok.split("://", 1)[1] if "://" in tok else tok
+        return tok == ep_norm or tok_noscheme == ep_norm
+
+    status_code, title, tech, snippet = None, "", [], ""
+    httpx_path = base / "live" / "httpx_full.txt"
+    if httpx_path.is_file():
+        for raw in httpx_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            tok = _first_token(raw)
+            if tok and _token_matches(tok):
+                snippet = raw[:512]
+                parts = raw.split("[")
+                for i, chunk in enumerate(parts[1:], start=1):
+                    val = chunk.split("]")[0].strip()
+                    if val.isdigit() and status_code is None:
+                        status_code = int(val)
+                    elif i == 2 and val and not title:
+                        title = val
+                    elif i >= 3 and val and "," in val:
+                        tech = [t.strip() for t in val.split(",") if t.strip()][:10]
+                break
+
+    params: list[str] = []
+    params_path = base / "params" / "all.txt"
+    if params_path.is_file() and endpoint:
+        ep_path = "/" in ep_norm and "/" + ep_norm.split("/", 1)[1] or ""
+        ep_host = ep_norm.split("/", 1)[0]
+        for raw in params_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            low = line.lower()
+            if ep_host in low or (ep_path and ep_path.lower() in low):
+                params.append(line[:200])
+            if len(params) >= 20:
+                break
+
+    payload = {
+        "status": "completed" if status_code is not None or snippet else "not_probed",
+        "target": target,
+        "endpoint": endpoint,
+        "http": {"status_code": status_code, "title": title[:200], "tech": tech},
+        "params": params,
+        "snippet": snippet,
+        "summary": (f"endpoint slice: status={status_code}, "
+                    f"{len(params)} param lines" if status_code is not None
+                    else "endpoint not found in live/httpx_full.txt"),
+    }
+    return _cap_bytes(payload, items_key="params")
+
+
+def compile_scope(program_handle: str) -> dict[str, Any]:
+    """Compile a program's scope via tools/scope_compiler.py (no subprocess).
+
+    Credentials are loaded exclusively through tools/credentials.py and are
+    only ever used inside Authorization headers by the compiler — they are
+    never logged, echoed, or stored in the manifest. Returns the compiler's
+    redacted summary (counts, filesystem paths, short hash — never tokens).
+    """
+    _sys_path()
+    try:
+        from tools.scope_compiler import ScopeCompilerError, compile_and_save
+    except ImportError as exc:
+        return {"status": "failed", "error": "RESEARCH_FAILED",
+                "reason": f"scope_compiler unavailable: {exc}"}
+    creds = None
+    try:
+        from tools.credentials import load_credentials
+        creds = load_credentials(interactive=False)
+    except Exception:  # noqa: BLE001 — keyless fallback is fine
+        creds = None
+    try:
+        summary = compile_and_save(program_handle, creds=creds)
+    except (ScopeCompilerError, ValueError) as exc:
+        return {"status": "failed", "error": "RESEARCH_FAILED",
+                "reason": str(exc)[:300]}
+    handle = summary.get("program_handle", "")
+    return {
+        "status": "completed",
+        **summary,
+        "summary": (f"Compiled scope for {handle}: "
+                    f"{summary.get('allow_patterns')} allow / "
+                    f"{summary.get('exclude_patterns')} exclude "
+                    f"(sha256:{summary.get('manifest_sha256', '')[:16]})"),
+        "next_action": "active tools now authorized by this manifest",
+    }

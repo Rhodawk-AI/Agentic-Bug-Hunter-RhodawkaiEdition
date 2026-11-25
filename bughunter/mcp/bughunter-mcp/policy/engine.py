@@ -54,6 +54,14 @@ class PolicyEngine:
         self._excluded = excluded_domains
         self._excluded_classes = excluded_classes
         self._checker = None
+        # Commit 3: session manifest state. A CompiledScopeManifest loaded via
+        # load_manifest() (SHA-256 verified) is the third way to authorize a
+        # session — next to explicit scope_domains — and removes the old
+        # `scope_domains or [target]` self-authorization from the server tools.
+        self.manifest = None
+        self.manifest_path: str | None = None
+        self.mandatory_headers: dict[str, str] = {}
+        self.max_rps: float | None = None
         if self._domains:
             self.set_scope(self._domains, excluded_domains)
         if auto_approve is None:
@@ -63,6 +71,57 @@ class PolicyEngine:
         self.auto_approve = auto_approve
         self.discovered: set[str] = set()
         self.authorized: set[str] = {d.lstrip("*.").lower() for d in self._domains if d}
+
+    def load_manifest(self, manifest_path: str) -> dict[str, Any]:
+        """Load a compiled scope manifest as THE session scope (Commit 3).
+
+        Loads the CompiledScopeManifest with SHA-256 verification enforced
+        (require_valid_hash=True — a tampered file raises ValueError), builds
+        the authoritative ScopeChecker via ScopeChecker.from_manifest(), and
+        stores the manifest plus its policy knobs (excluded_classes,
+        mandatory_headers, max_rps) for the server tools to surface and
+        enforce.
+
+        Raises:
+            ValueError: manifest file tampered (hash mismatch) or a dangerous
+                pattern inside it (ScopeError subclasses ValueError).
+            OSError: manifest file missing/unreadable.
+
+        Returns a redacted summary (counts + short hash — never raw asset
+        dumps) for tool responses.
+        """
+        _ensure_path()
+        from contracts.scope import CompiledScopeManifest
+        from tools.scope_checker import ScopeChecker
+
+        manifest = CompiledScopeManifest.load(
+            str(manifest_path), require_valid_hash=True)
+        checker = ScopeChecker.from_manifest(manifest)
+
+        self._checker = checker
+        self._domains = [d.lower() for d in manifest.allow_patterns]
+        self._excluded_classes = [c.lower() for c in manifest.excluded_classes]
+        self.manifest = manifest
+        self.manifest_path = str(manifest_path)
+        self.mandatory_headers = {str(k): str(v)
+                                  for k, v in (manifest.mandatory_headers or {}).items()}
+        try:
+            self.max_rps = float(manifest.max_rps)
+        except (TypeError, ValueError):
+            self.max_rps = None
+        self.authorized = {d.lstrip("*.").lower() for d in self._domains if d}
+        return {
+            "program_handle": manifest.program_handle,
+            "program_name": manifest.program_name,
+            "auth_mode": manifest.auth_mode,
+            "manifest_path": self.manifest_path,
+            "manifest_sha256": manifest.manifest_sha256[:16],
+            "allow_count": len(manifest.allow_patterns),
+            "exclude_count": len(manifest.exclude_patterns),
+            "excluded_classes": list(manifest.excluded_classes),
+            "mandatory_headers": dict(self.mandatory_headers),
+            "max_rps": self.max_rps,
+        }
 
     def set_scope(self, domains: list[str], excluded_domains: list[str] | None = None) -> None:
         _ensure_path()
@@ -117,6 +176,11 @@ class PolicyEngine:
         scope_domains = args.get("scope_domains") or args.get("domains")
         if scope_domains and isinstance(scope_domains, list) and scope_domains:
             self.set_scope([str(d) for d in scope_domains])
+        # NOTE (Commit 3): there is deliberately NO fallback to [target] here.
+        # When neither explicit scope_domains nor a previously loaded manifest
+        # authorizes the session, requires_scope tools fail closed below with
+        # SCOPE_REQUIRED — the server no longer self-authorizes the caller's
+        # own target string as a scope pattern.
 
         if meta.requires_scope:
             if not self._domains or not self._checker:
@@ -197,7 +261,7 @@ def denied_payload(decision: Decision) -> dict[str, Any]:
         "reason": decision.reason,
         "details": decision.details,
         "next_action": {
-            SCOPE_REQUIRED: "Pass scope_domains or configure scope first",
+            SCOPE_REQUIRED: "Pass scope_domains, call bughunter_compile_scope, or pass a manifest_path",
             OUT_OF_SCOPE: "Choose an in-scope target",
             TARGET_REQUIRED: "Provide target",
             ACTIVE_TEST_APPROVAL_REQUIRED: "Pass approve=true after researcher confirmation",
