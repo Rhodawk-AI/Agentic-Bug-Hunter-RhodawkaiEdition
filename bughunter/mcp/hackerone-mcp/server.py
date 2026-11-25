@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-HackerOne MCP Server — public endpoints only (no auth required).
+HackerOne MCP Server — public endpoints + authenticated scope pull.
 
 Provides three tools:
   - search_disclosed_reports: Search Hacktivity for disclosed reports
   - get_program_stats: Bounty ranges, response times, resolved counts
   - get_program_policy: Safe harbor, response SLA, excluded vuln classes
+    (Commit 2: backed by tools/scope_compiler.py — authenticated paginated
+    REST when H1 credentials are configured via the credential vault,
+    cursor-paginated public GraphQL fallback when keyless — so >50 scope
+    items are never truncated)
 
-This is a lightweight wrapper around HackerOne's public GraphQL API.
+This is a lightweight wrapper around HackerOne's public GraphQL API plus the
+shared scope compiler for program scope/policy reads.
 Authenticated endpoints (submit_report, private scope) are deferred.
 
 Usage (standalone test):
@@ -26,6 +31,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from datetime import datetime, timezone
+from pathlib import Path
 
 
 # ─── SSL context ─────────────────────────────────────────────────────────────
@@ -45,6 +51,20 @@ except ImportError:
 H1_GRAPHQL = "https://hackerone.com/graphql"
 DEFAULT_TIMEOUT = 15
 
+# ─── Shared scope compiler (Commit 2) ────────────────────────────────────────
+# get_program_policy routes through tools/scope_compiler.py for lossless
+# scope reads. The compiler is optional: when unavailable (stripped install,
+# standalone copy) get_program_policy falls back to the legacy inline
+# GraphQL read below, preserving pre-Commit-2 behavior.
+_REPO_ROOT = Path(__file__).resolve().parents[3]  # .../Agentic-Bug-Hunter...
+for _p in (str(_REPO_ROOT / "bughunter"), str(_REPO_ROOT)):
+    if _p not in sys.path and Path(_p).is_dir():
+        sys.path.insert(0, _p)
+try:
+    from tools import scope_compiler as _scope_compiler
+except ImportError:
+    _scope_compiler = None
+
 
 def _escape_graphql_string(s: str) -> str:
     """Escape a value for safe interpolation inside a GraphQL double-quoted string."""
@@ -63,9 +83,15 @@ class HackerOneAPIError(Exception):
         self.status_code = status_code
 
 
-def _graphql_request(query: str, timeout: int = DEFAULT_TIMEOUT) -> dict:
-    """Execute a GraphQL request against HackerOne's public API."""
-    payload = json.dumps({"query": query}).encode("utf-8")
+def _graphql_request(query: str, variables: dict | None = None,
+                     timeout: int = DEFAULT_TIMEOUT) -> dict:
+    """Execute a GraphQL request against HackerOne's public API.
+
+    ``variables`` is optional (Commit 2): the scope compiler passes cursor
+    pagination variables through this same verified-SSL path.
+    """
+    payload = json.dumps({"query": query,
+                          "variables": variables or {}}).encode("utf-8")
     req = urllib.request.Request(
         H1_GRAPHQL,
         data=payload,
@@ -228,14 +254,11 @@ def get_program_stats(program: str) -> dict:
 
 # ─── Tool: get_program_policy ────────────────────────────────────────────────
 
-def get_program_policy(program: str) -> dict:
-    """Get the public policy for a HackerOne program.
+def _get_program_policy_legacy(program: str) -> dict:
+    """Pre-Commit-2 inline GraphQL read (kept for stripped installs).
 
-    Args:
-        program: HackerOne program handle (e.g. "shopify")
-
-    Returns:
-        Dict with safe harbor status, response SLAs, excluded vuln classes.
+    Truncated at first: 50 scope items — scope_compiler removes that limit;
+    this path only survives when tools/scope_compiler.py is unavailable.
     """
     safe_program = _escape_graphql_string(program)
     query = f"""{{
@@ -279,6 +302,49 @@ def get_program_policy(program: str) -> dict:
         "policy_text": team.get("policy", ""),
         "scopes": scopes,
     }
+
+
+def get_program_policy(program: str) -> dict:
+    """Get the public policy for a HackerOne program (lossless scope read).
+
+    Commit 2: routes through tools/scope_compiler.py — authenticated
+    paginated REST API when credentials are configured in the vault,
+    cursor-paginated public GraphQL fallback when keyless — so programs with
+    more than 50 scope items are no longer truncated. Credentials always come
+    from the credential vault; tokens never appear in the returned dict.
+
+    Args:
+        program: HackerOne program handle (e.g. "shopify")
+
+    Returns:
+        Dict with safe harbor status, response SLAs, excluded vuln classes.
+    """
+    if _scope_compiler is not None:
+        try:
+            fetched = _scope_compiler.fetch_program_scope(
+                program, graphql_fn=_graphql_request)
+        except _scope_compiler.ProgramNotFoundError as e:
+            return {"error": str(e), "program": program}
+        except HackerOneAPIError:
+            raise
+        except _scope_compiler.ScopeCompilerError as e:
+            # Preserve the historical error contract of this tool.
+            raise HackerOneAPIError(str(e),
+                                    status_code=getattr(e, "status_code", None))
+        return {
+            "program": fetched["handle"],
+            "name": fetched["program_name"],
+            "offers_bounties": bool(fetched.get("offers_bounties", False)),
+            "policy_text": fetched.get("policy_md", ""),
+            "scopes": [{
+                "type": a.asset_type,
+                "identifier": a.asset_identifier,
+                "bounty_eligible": a.eligible_for_bounty,
+                "submission_eligible": a.eligible_for_submission,
+                "instruction": a.instruction,
+            } for a in fetched["assets"]],
+        }
+    return _get_program_policy_legacy(program)
 
 
 # ─── CLI interface ───────────────────────────────────────────────────────────
